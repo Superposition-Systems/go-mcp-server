@@ -6,14 +6,19 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 )
+
+// validScope matches safe scope strings (alphanumeric, colon, dot, underscore, hyphen, space).
+var validScope = regexp.MustCompile(`^[a-zA-Z0-9:._\- ]+$`)
 
 // OAuthStore persists OAuth 2.0 clients, auth codes, and tokens in SQLite.
 // Uses pure-Go SQLite (modernc.org/sqlite) for CGO-free builds compatible
@@ -59,6 +64,10 @@ type TokenData struct {
 // NewOAuthStore opens (or creates) a SQLite database at dbPath for OAuth state.
 // The scope parameter sets the default OAuth scope (e.g. "mcp:tools").
 func NewOAuthStore(dbPath string, scope string) (*OAuthStore, error) {
+	if scope != "" && !validScope.MatchString(scope) {
+		return nil, fmt.Errorf("invalid scope: contains disallowed characters")
+	}
+
 	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("create db directory: %w", err)
@@ -69,8 +78,14 @@ func NewOAuthStore(dbPath string, scope string) (*OAuthStore, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 
-	db.Exec("PRAGMA journal_mode=WAL")
-	db.Exec("PRAGMA foreign_keys=ON")
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set WAL mode: %w", err)
+	}
+	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("enable foreign keys: %w", err)
+	}
 
 	store := &OAuthStore{db: db, maxClients: 1000, scope: scope}
 	if err := store.createTables(); err != nil {
@@ -92,7 +107,6 @@ func (s *OAuthStore) DefaultScope() string {
 }
 
 func (s *OAuthStore) createTables() error {
-	scope := s.scope
 	_, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS clients (
 			client_id TEXT PRIMARY KEY,
@@ -102,7 +116,7 @@ func (s *OAuthStore) createTables() error {
 			token_endpoint_auth_method TEXT DEFAULT 'client_secret_post',
 			grant_types TEXT DEFAULT '["authorization_code","refresh_token"]',
 			response_types TEXT DEFAULT '["code"]',
-			scope TEXT DEFAULT '` + scope + `',
+			scope TEXT DEFAULT '',
 			client_name TEXT
 		);
 		CREATE TABLE IF NOT EXISTS auth_codes (
@@ -111,22 +125,32 @@ func (s *OAuthStore) createTables() error {
 			redirect_uri TEXT NOT NULL DEFAULT '',
 			code_challenge TEXT NOT NULL DEFAULT '',
 			code_challenge_method TEXT DEFAULT 'S256',
-			scope TEXT DEFAULT '` + scope + `',
+			scope TEXT DEFAULT '',
 			created_at INTEGER NOT NULL,
 			FOREIGN KEY (client_id) REFERENCES clients(client_id)
 		);
 		CREATE TABLE IF NOT EXISTS access_tokens (
 			token TEXT PRIMARY KEY,
 			client_id TEXT NOT NULL,
-			scope TEXT DEFAULT '` + scope + `',
+			scope TEXT DEFAULT '',
 			expires_at INTEGER NOT NULL,
 			created_at INTEGER NOT NULL
 		);
 		CREATE TABLE IF NOT EXISTS refresh_tokens (
 			token TEXT PRIMARY KEY,
 			client_id TEXT NOT NULL,
-			scope TEXT DEFAULT '` + scope + `',
+			scope TEXT DEFAULT '',
 			expires_at INTEGER NOT NULL,
+			created_at INTEGER NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS auth_requests (
+			request_id TEXT PRIMARY KEY,
+			client_id TEXT NOT NULL,
+			redirect_uri TEXT NOT NULL DEFAULT '',
+			state TEXT NOT NULL DEFAULT '',
+			code_challenge TEXT NOT NULL DEFAULT '',
+			code_challenge_method TEXT DEFAULT 'S256',
+			scope TEXT DEFAULT '',
 			created_at INTEGER NOT NULL
 		);
 	`)
@@ -139,7 +163,9 @@ func (s *OAuthStore) RegisterClient(metadata map[string]any) (*ClientData, error
 	defer s.mu.Unlock()
 
 	var count int
-	s.db.QueryRow("SELECT COUNT(*) FROM clients").Scan(&count)
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM clients").Scan(&count); err != nil {
+		return nil, fmt.Errorf("count clients: %w", err)
+	}
 	if count >= s.maxClients {
 		return nil, fmt.Errorf("max clients reached")
 	}
@@ -189,9 +215,15 @@ func (s *OAuthStore) GetClient(clientID string) (*ClientData, error) {
 	if err != nil {
 		return nil, err
 	}
-	json.Unmarshal([]byte(redirectURIs), &c.RedirectURIs)
-	json.Unmarshal([]byte(grantTypes), &c.GrantTypes)
-	json.Unmarshal([]byte(responseTypes), &c.ResponseTypes)
+	if err := json.Unmarshal([]byte(redirectURIs), &c.RedirectURIs); err != nil {
+		return nil, fmt.Errorf("unmarshal redirect_uris: %w", err)
+	}
+	if err := json.Unmarshal([]byte(grantTypes), &c.GrantTypes); err != nil {
+		return nil, fmt.Errorf("unmarshal grant_types: %w", err)
+	}
+	if err := json.Unmarshal([]byte(responseTypes), &c.ResponseTypes); err != nil {
+		return nil, fmt.Errorf("unmarshal response_types: %w", err)
+	}
 	return &c, nil
 }
 
@@ -219,7 +251,9 @@ func (s *OAuthStore) ConsumeAuthCode(code string) (*AuthCodeData, error) {
 	if err := row.Scan(&d.ClientID, &d.RedirectURI, &d.CodeChallenge, &d.CodeChallengeMethod, &d.Scope, &d.CreatedAt); err != nil {
 		return nil, err
 	}
-	s.db.Exec("DELETE FROM auth_codes WHERE code = ?", code)
+	if _, err := s.db.Exec("DELETE FROM auth_codes WHERE code = ?", code); err != nil {
+		return nil, fmt.Errorf("delete auth code: %w", err)
+	}
 
 	if time.Now().Unix()-d.CreatedAt > 300 {
 		return nil, fmt.Errorf("auth code expired")
@@ -244,10 +278,15 @@ func (s *OAuthStore) VerifyAccessToken(token string) bool {
 	var expiresAt int64
 	err := s.db.QueryRow("SELECT expires_at FROM access_tokens WHERE token = ?", token).Scan(&expiresAt)
 	if err != nil {
+		if err != sql.ErrNoRows {
+			log.Printf("mcpserver: failed to verify access token: %v", err)
+		}
 		return false
 	}
 	if time.Now().Unix() > expiresAt {
-		s.db.Exec("DELETE FROM access_tokens WHERE token = ?", token)
+		if _, err := s.db.Exec("DELETE FROM access_tokens WHERE token = ?", token); err != nil {
+			log.Printf("mcpserver: failed to delete expired token: %v", err)
+		}
 		return false
 	}
 	return true
@@ -274,29 +313,89 @@ func (s *OAuthStore) ConsumeRefreshToken(token string) (*TokenData, error) {
 	if err := row.Scan(&d.ClientID, &d.Scope, &d.ExpiresAt, &d.CreatedAt); err != nil {
 		return nil, err
 	}
-	s.db.Exec("DELETE FROM refresh_tokens WHERE token = ?", token)
-
+	// Check expiry before consuming
 	if time.Now().Unix() > d.ExpiresAt {
+		s.db.Exec("DELETE FROM refresh_tokens WHERE token = ?", token)
 		return nil, fmt.Errorf("refresh token expired")
+	}
+	if _, err := s.db.Exec("DELETE FROM refresh_tokens WHERE token = ?", token); err != nil {
+		return nil, fmt.Errorf("delete refresh token: %w", err)
 	}
 	return &d, nil
 }
 
-// Cleanup removes expired auth codes, access tokens, and refresh tokens.
+// StoreAuthRequest stores authorization request parameters server-side.
+func (s *OAuthStore) StoreAuthRequest(requestID string, data map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`INSERT INTO auth_requests (request_id, client_id, redirect_uri, state, code_challenge, code_challenge_method, scope, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		requestID, data["client_id"], data["redirect_uri"], data["state"],
+		data["code_challenge"], data["code_challenge_method"], data["scope"], time.Now().Unix(),
+	)
+	return err
+}
+
+// GetAuthRequest retrieves and deletes an authorization request (single-use).
+func (s *OAuthStore) GetAuthRequest(requestID string) (map[string]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var clientID, redirectURI, state, codeChallenge, codeChallengeMethod, scope string
+	var createdAt int64
+	err := s.db.QueryRow(
+		"SELECT client_id, redirect_uri, state, code_challenge, code_challenge_method, scope, created_at FROM auth_requests WHERE request_id = ?",
+		requestID,
+	).Scan(&clientID, &redirectURI, &state, &codeChallenge, &codeChallengeMethod, &scope, &createdAt)
+	if err != nil {
+		return nil, err
+	}
+	// Check expiry before consuming (10 minutes)
+	if time.Now().Unix()-createdAt > 600 {
+		s.db.Exec("DELETE FROM auth_requests WHERE request_id = ?", requestID)
+		return nil, fmt.Errorf("auth request expired")
+	}
+	// Delete after reading (single-use)
+	if _, err := s.db.Exec("DELETE FROM auth_requests WHERE request_id = ?", requestID); err != nil {
+		return nil, fmt.Errorf("delete auth request: %w", err)
+	}
+	return map[string]string{
+		"client_id":             clientID,
+		"redirect_uri":         redirectURI,
+		"state":                state,
+		"code_challenge":       codeChallenge,
+		"code_challenge_method": codeChallengeMethod,
+		"scope":                scope,
+	}, nil
+}
+
+// Cleanup removes expired auth codes, access tokens, refresh tokens, and auth requests.
 // Call this periodically (e.g. every 5 minutes) from a background goroutine.
-func (s *OAuthStore) Cleanup() {
+func (s *OAuthStore) Cleanup() error {
 	now := time.Now().Unix()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.db.Exec("DELETE FROM auth_codes WHERE created_at < ?", now-300)
-	s.db.Exec("DELETE FROM access_tokens WHERE expires_at < ?", now)
-	s.db.Exec("DELETE FROM refresh_tokens WHERE expires_at < ?", now)
+	if _, err := s.db.Exec("DELETE FROM auth_codes WHERE created_at < ?", now-300); err != nil {
+		return fmt.Errorf("cleanup auth codes: %w", err)
+	}
+	if _, err := s.db.Exec("DELETE FROM access_tokens WHERE expires_at < ?", now); err != nil {
+		return fmt.Errorf("cleanup access tokens: %w", err)
+	}
+	if _, err := s.db.Exec("DELETE FROM refresh_tokens WHERE expires_at < ?", now); err != nil {
+		return fmt.Errorf("cleanup refresh tokens: %w", err)
+	}
+	if _, err := s.db.Exec("DELETE FROM auth_requests WHERE created_at < ?", now-600); err != nil {
+		return fmt.Errorf("cleanup auth requests: %w", err)
+	}
+	return nil
 }
 
 // RandomHex generates n random bytes and returns them as a hex string.
 func RandomHex(n int) string {
 	b := make([]byte, n)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto/rand: " + err.Error())
+	}
 	return hex.EncodeToString(b)
 }
 

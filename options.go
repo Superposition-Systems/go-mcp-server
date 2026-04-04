@@ -50,10 +50,11 @@ func WithBearerToken(token string) Option {
 }
 
 // WithMCPPath sets the MCP endpoint path (default "/mcp").
+// ResourcePath is resolved lazily in ListenAndServe from mcpPath,
+// so this option can be used in any order with WithAuth.
 func WithMCPPath(path string) Option {
 	return func(s *Server) {
 		s.mcpPath = path
-		s.oauthConfig.ResourcePath = path
 	}
 }
 
@@ -61,10 +62,14 @@ func WithMCPPath(path string) Option {
 func WithAuth(cfg auth.OAuthConfig) Option {
 	return func(s *Server) {
 		s.oauthConfig = cfg
-		if cfg.ResourcePath == "" {
-			s.oauthConfig.ResourcePath = s.mcpPath
-		}
+		// ResourcePath is resolved lazily in ListenAndServe from s.mcpPath
 	}
+}
+
+// WithOAuthDBPath sets the SQLite database path for OAuth state
+// (default reads from OAUTH_DB_PATH env, fallback "/data/oauth.db").
+func WithOAuthDBPath(path string) Option {
+	return func(s *Server) { s.oauthDBPath = path }
 }
 
 // WithScope sets the OAuth scope (default "mcp:tools").

@@ -67,7 +67,7 @@ const traefikTemplate = `    labels:
       - "traefik.http.routers.{{.ServiceName}}-health.entrypoints=websecure"
       - "traefik.http.routers.{{.ServiceName}}-health.tls.certresolver={{.CertResolver}}"
       - "traefik.http.routers.{{.ServiceName}}-health.service={{.ServiceName}}"
-      - "traefik.http.routers.{{.ServiceName}}-health.priority=100"
+      - "traefik.http.routers.{{.ServiceName}}-health.priority=120"
       - "traefik.http.routers.{{.ServiceName}}-health.middlewares=rate-limit,{{.SecurityMiddleware}}"
 
       # -----------------------------------------------------------------------
@@ -124,6 +124,9 @@ const traefikTemplate = `    labels:
 // server deployment. The returned string is ready to paste into a
 // docker-compose.yml service definition.
 func GenerateTraefikLabels(cfg TraefikConfig) (string, error) {
+	if err := validateTraefikConfig(cfg); err != nil {
+		return "", err
+	}
 	if cfg.Port == "" {
 		cfg.Port = "8080"
 	}

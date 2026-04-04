@@ -39,8 +39,11 @@ ENTRYPOINT ["/{{.BinaryName}}"]
 // GenerateDockerfile renders a two-stage Dockerfile for a Go MCP server.
 // Uses distroless for minimal attack surface (~12 MB final image).
 func GenerateDockerfile(cfg DockerfileConfig) (string, error) {
+	if err := validateDockerfileConfig(cfg); err != nil {
+		return "", err
+	}
 	if cfg.GoVersion == "" {
-		cfg.GoVersion = "1.25"
+		cfg.GoVersion = "1.24"
 	}
 	if cfg.Port == "" {
 		cfg.Port = "8080"

@@ -49,7 +49,7 @@ func main() {
 		mcpserver.WithVersion("0.1.0"),
 		mcpserver.WithInstructions("An example MCP server that greets people."),
 		mcpserver.WithPort(envOr("PORT", "8080")),
-		mcpserver.WithPIN(envOr("AUTH_PIN", "1234")),
+		mcpserver.WithPIN(os.Getenv("AUTH_PIN")), // AUTH_PIN env var required for production
 		mcpserver.WithBearerToken(envOr("BEARER_TOKEN", "test-token")),
 		mcpserver.WithConsent("Example MCP", "Enter the PIN to connect."),
 	)
@@ -80,7 +80,9 @@ func greet(name string) string {
 func greetHandler(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"greeting": greet(name)})
+	if err := json.NewEncoder(w).Encode(map[string]string{"greeting": greet(name)}); err != nil {
+		log.Printf("failed to write response: %v", err)
+	}
 }
 
 // --- MCP ToolHandler ---

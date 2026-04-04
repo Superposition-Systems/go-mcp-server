@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 )
@@ -18,6 +19,7 @@ const protocolVersion = "2025-03-26"
 func TransportHandler(info ServerInfo, tools ToolHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
 			http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
 			return
 		}
@@ -28,22 +30,31 @@ func TransportHandler(info ServerInfo, tools ToolHandler) http.HandlerFunc {
 func handlePost(w http.ResponseWriter, r *http.Request, info ServerInfo, tools ToolHandler) {
 	accept := r.Header.Get("Accept")
 	if !strings.Contains(accept, "application/json") || !strings.Contains(accept, "text/event-stream") {
-		writeSSE(w, JSONRPCResponse{
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusNotAcceptable)
+		if err := json.NewEncoder(w).Encode(JSONRPCResponse{
 			JSONRPC: "2.0",
 			ID:      "server-error",
 			Error:   &RPCError{Code: -32600, Message: "Not Acceptable: Client must accept both application/json and text/event-stream"},
-		})
-		w.WriteHeader(http.StatusNotAcceptable)
+		}); err != nil {
+			log.Printf("mcpserver: failed to write error response: %v", err)
+		}
 		return
 	}
 
 	ct := r.Header.Get("Content-Type")
 	if !strings.Contains(ct, "application/json") {
-		writeSSE(w, JSONRPCResponse{
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusUnsupportedMediaType)
+		if err := json.NewEncoder(w).Encode(JSONRPCResponse{
 			JSONRPC: "2.0",
 			ID:      "server-error",
 			Error:   &RPCError{Code: -32600, Message: "Unsupported Media Type: Content-Type must be application/json"},
-		})
+		}); err != nil {
+			log.Printf("mcpserver: failed to write error response: %v", err)
+		}
 		return
 	}
 
@@ -121,8 +132,13 @@ func handleToolsCall(w http.ResponseWriter, r *http.Request, req JSONRPCRequest,
 
 	result, isError := tools.Call(r.Context(), params.Name, params.Arguments)
 
+	text, marshalErr := marshalResult(result)
+	if marshalErr != nil {
+		isError = true
+	}
+
 	content := []map[string]any{
-		{"type": "text", "text": toJSON(result)},
+		{"type": "text", "text": text},
 	}
 
 	writeSSE(w, JSONRPCResponse{
@@ -139,8 +155,17 @@ func handleToolsCall(w http.ResponseWriter, r *http.Request, req JSONRPCRequest,
 func writeSSE(w http.ResponseWriter, resp JSONRPCResponse) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 
-	data, _ := json.Marshal(resp)
+	data, err := json.Marshal(resp)
+	if err != nil {
+		// Fallback: send a hardcoded error that cannot itself fail to marshal
+		fmt.Fprintf(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error: failed to marshal response\"}}\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		return
+	}
 	fmt.Fprintf(w, "event: message\ndata: %s\n\n", data)
 
 	if f, ok := w.(http.Flusher); ok {
@@ -148,7 +173,14 @@ func writeSSE(w http.ResponseWriter, resp JSONRPCResponse) {
 	}
 }
 
-func toJSON(v any) string {
-	b, _ := json.Marshal(v)
-	return string(b)
+// marshalResult serializes a tool result to JSON. Returns the JSON string
+// and a non-nil error if marshaling failed (caller should set isError=true).
+func marshalResult(v any) (string, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		// Use json.Marshal for the fallback to guarantee valid JSON escaping
+		fallback, _ := json.Marshal(map[string]string{"error": "failed to marshal result: " + err.Error()})
+		return string(fallback), err
+	}
+	return string(b), nil
 }

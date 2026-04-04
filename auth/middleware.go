@@ -76,7 +76,7 @@ func BearerMiddleware(bearerToken string, store *OAuthStore, protectedPaths ...s
 			// Check if this path requires bearer auth
 			protected := false
 			for _, prefix := range protectedPaths {
-				if strings.HasPrefix(path, prefix) || path == prefix {
+				if strings.HasPrefix(path, prefix) {
 					protected = true
 					break
 				}

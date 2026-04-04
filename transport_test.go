@@ -241,7 +241,14 @@ func TestInvalidAcceptHeader(t *testing.T) {
 	rec := httptest.NewRecorder()
 	handler(rec, req)
 
-	resp := parseSSEResponse(t, rec.Body.String())
+	if rec.Code != http.StatusNotAcceptable {
+		t.Errorf("expected 406, got %d", rec.Code)
+	}
+
+	var resp JSONRPCResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse JSON response: %v", err)
+	}
 	if resp.Error == nil {
 		t.Fatal("expected error for invalid Accept header")
 	}
@@ -260,7 +267,14 @@ func TestInvalidContentType(t *testing.T) {
 	rec := httptest.NewRecorder()
 	handler(rec, req)
 
-	resp := parseSSEResponse(t, rec.Body.String())
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Errorf("expected 415, got %d", rec.Code)
+	}
+
+	var resp JSONRPCResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse JSON response: %v", err)
+	}
 	if resp.Error == nil {
 		t.Fatal("expected error for invalid Content-Type")
 	}
@@ -297,6 +311,9 @@ func TestMethodNotAllowed(t *testing.T) {
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("expected 405, got %d", rec.Code)
 	}
+	if allow := rec.Header().Get("Allow"); allow != "POST" {
+		t.Errorf("expected Allow: POST header, got %q", allow)
+	}
 }
 
 func TestSSEContentType(t *testing.T) {
@@ -326,5 +343,31 @@ func TestToolsCallInvalidParams(t *testing.T) {
 	}
 	if resp.Error.Code != -32602 {
 		t.Errorf("expected error code -32602, got %d", resp.Error.Code)
+	}
+}
+
+func TestToolsCallMarshalError(t *testing.T) {
+	info := ServerInfo{Name: "test", Version: "1.0.0"}
+	mock := &mockToolHandler{
+		tools: []ToolDef{{Name: "bad", Description: "Returns unmarshalable", InputSchema: map[string]any{"type": "object"}}},
+		callFn: func(ctx context.Context, name string, args map[string]any) (any, bool) {
+			return func() {}, false // functions can't be marshalled
+		},
+	}
+	handler := TransportHandler(info, mock)
+	rec := doPost(handler, "tools/call", map[string]any{"name": "bad", "arguments": map[string]any{}})
+
+	resp := parseSSEResponse(t, rec.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected RPC error: %v", resp.Error)
+	}
+	result := resp.Result.(map[string]any)
+	if result["isError"] != true {
+		t.Error("expected isError to be true when marshal fails")
+	}
+	content := result["content"].([]any)
+	first := content[0].(map[string]any)
+	if !strings.Contains(first["text"].(string), "failed to marshal") {
+		t.Errorf("expected marshal error in content text, got: %s", first["text"])
 	}
 }

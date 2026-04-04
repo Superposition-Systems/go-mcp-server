@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -117,7 +118,6 @@ func (h *OAuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.RegLimiter.RecordFailure(ip)
 	writeOAuthJSON(w, http.StatusCreated, client)
 }
 
@@ -131,6 +131,23 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// PKCE is mandatory — require code_challenge
+	if q.Get("code_challenge") == "" {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "code_challenge is required (PKCE S256)."))
+		return
+	}
+
+	// Validate code_challenge_method
+	ccm := q.Get("code_challenge_method")
+	if ccm != "" && ccm != "S256" {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Unsupported code_challenge_method. Only S256 is supported."))
+		return
+	}
+
 	client, err := h.Store.GetClient(q.Get("client_id"))
 	if err != nil || client == nil {
 		w.Header().Set("Content-Type", "text/html")
@@ -139,26 +156,47 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, _ := json.Marshal(map[string]string{
+	// Validate scope against allowed scope
+	reqScope := q.Get("scope")
+	if reqScope != "" && reqScope != h.config.Scope {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Invalid scope."))
+		return
+	}
+
+	// Store auth request server-side (not in form)
+	requestID := uuid.New().String()
+	if err := h.Store.StoreAuthRequest(requestID, map[string]string{
 		"client_id":             q.Get("client_id"),
 		"redirect_uri":         q.Get("redirect_uri"),
 		"state":                q.Get("state"),
 		"code_challenge":       q.Get("code_challenge"),
 		"code_challenge_method": q.Get("code_challenge_method"),
 		"scope":                q.Get("scope"),
-	})
+	}); err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Server error."))
+		return
+	}
 
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, string(ctx), ""))
+	fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, requestID, ""))
 }
 
 // AuthorizePOST validates the PIN and issues an authorization code.
 func (h *OAuthHandler) AuthorizePOST(w http.ResponseWriter, r *http.Request) {
-	r.ParseForm()
+	if err := r.ParseForm(); err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Invalid form data."))
+		return
+	}
 	pin := r.FormValue("pin")
-	authContextRaw := r.FormValue("auth_context")
+	requestID := r.FormValue("auth_context") // reuse field name for the opaque request ID
 
-	if authContextRaw == "" {
+	if requestID == "" {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Missing authorization context."))
@@ -169,14 +207,14 @@ func (h *OAuthHandler) AuthorizePOST(w http.ResponseWriter, r *http.Request) {
 	if h.PINLimiter.IsRateLimited(ip) {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusTooManyRequests)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, authContextRaw, "Too many attempts. Try later."))
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, requestID, "Too many attempts. Try later."))
 		return
 	}
 
 	if h.config.PIN == "" {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, authContextRaw, "Server PIN not configured."))
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, requestID, "Server PIN not configured."))
 		return
 	}
 
@@ -184,16 +222,17 @@ func (h *OAuthHandler) AuthorizePOST(w http.ResponseWriter, r *http.Request) {
 		h.PINLimiter.RecordFailure(ip)
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusForbidden)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, authContextRaw, "Incorrect PIN."))
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, requestID, "Incorrect PIN."))
 		return
 	}
 	h.PINLimiter.Clear(ip)
 
-	var authCtx map[string]string
-	if err := json.Unmarshal([]byte(authContextRaw), &authCtx); err != nil {
+	// Retrieve server-side stored auth request (tamper-proof)
+	authCtx, err := h.Store.GetAuthRequest(requestID)
+	if err != nil {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Invalid context."))
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Authorization request expired or invalid."))
 		return
 	}
 
@@ -205,31 +244,41 @@ func (h *OAuthHandler) AuthorizePOST(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(client.RedirectURIs) > 0 {
-		found := false
-		for _, u := range client.RedirectURIs {
-			if u == authCtx["redirect_uri"] {
-				found = true
-				break
-			}
+	// Redirect URI validation — ALWAYS required, reject if client has no URIs
+	if len(client.RedirectURIs) == 0 {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Client has no registered redirect URIs."))
+		return
+	}
+	found := false
+	for _, u := range client.RedirectURIs {
+		if u == authCtx["redirect_uri"] {
+			found = true
+			break
 		}
-		if !found {
-			w.Header().Set("Content-Type", "text/html")
-			w.WriteHeader(http.StatusBadRequest)
-			fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Invalid redirect_uri"))
-			return
-		}
+	}
+	if !found {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Invalid redirect_uri"))
+		return
 	}
 
 	code := uuid.New().String()
-	h.Store.StoreAuthCode(code, AuthCodeData{
+	if err := h.Store.StoreAuthCode(code, AuthCodeData{
 		ClientID:            authCtx["client_id"],
 		RedirectURI:         authCtx["redirect_uri"],
 		CodeChallenge:       authCtx["code_challenge"],
 		CodeChallengeMethod: authCtx["code_challenge_method"],
 		Scope:               authCtx["scope"],
 		CreatedAt:           time.Now().Unix(),
-	})
+	}); err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Failed to create authorization code."))
+		return
+	}
 
 	redirectURI := authCtx["redirect_uri"]
 	params := url.Values{"code": {code}}
@@ -246,7 +295,10 @@ func (h *OAuthHandler) AuthorizePOST(w http.ResponseWriter, r *http.Request) {
 
 // Token handles authorization code exchange and refresh token rotation.
 func (h *OAuthHandler) Token(w http.ResponseWriter, r *http.Request) {
-	r.ParseForm()
+	if err := r.ParseForm(); err != nil {
+		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request"})
+		return
+	}
 	grantType := r.FormValue("grant_type")
 
 	switch grantType {
@@ -281,15 +333,22 @@ func (h *OAuthHandler) exchangeAuthCode(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if codeData.CodeChallenge != "" {
-		if codeVerifier == "" {
-			writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant", "error_description": "code_verifier required"})
-			return
-		}
-		if !pkceVerify(codeVerifier, codeData.CodeChallenge) {
-			writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant", "error_description": "PKCE failed"})
-			return
-		}
+	// PKCE is mandatory — reject if no code_challenge was stored
+	if codeData.CodeChallenge == "" {
+		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant", "error_description": "code_challenge required"})
+		return
+	}
+	if codeData.CodeChallengeMethod != "" && codeData.CodeChallengeMethod != "S256" {
+		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant", "error_description": "unsupported code_challenge_method"})
+		return
+	}
+	if codeVerifier == "" {
+		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant", "error_description": "code_verifier required"})
+		return
+	}
+	if !pkceVerify(codeVerifier, codeData.CodeChallenge) {
+		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant", "error_description": "PKCE failed"})
+		return
 	}
 
 	now := time.Now().Unix()
@@ -299,10 +358,16 @@ func (h *OAuthHandler) exchangeAuthCode(w http.ResponseWriter, r *http.Request) 
 	}
 
 	accessToken := RandomHex(32)
-	h.Store.StoreAccessToken(accessToken, TokenData{ClientID: clientID, Scope: scope, ExpiresAt: now + 3600, CreatedAt: now})
+	if err := h.Store.StoreAccessToken(accessToken, TokenData{ClientID: clientID, Scope: scope, ExpiresAt: now + 3600, CreatedAt: now}); err != nil {
+		writeOAuthJSON(w, http.StatusInternalServerError, map[string]any{"error": "server_error"})
+		return
+	}
 
 	refreshToken := RandomHex(32)
-	h.Store.StoreRefreshToken(refreshToken, TokenData{ClientID: clientID, Scope: scope, ExpiresAt: now + 30*24*3600, CreatedAt: now})
+	if err := h.Store.StoreRefreshToken(refreshToken, TokenData{ClientID: clientID, Scope: scope, ExpiresAt: now + 30*24*3600, CreatedAt: now}); err != nil {
+		writeOAuthJSON(w, http.StatusInternalServerError, map[string]any{"error": "server_error"})
+		return
+	}
 
 	writeOAuthJSON(w, http.StatusOK, map[string]any{
 		"access_token":  accessToken,
@@ -338,10 +403,16 @@ func (h *OAuthHandler) exchangeRefreshToken(w http.ResponseWriter, r *http.Reque
 	scope := tokenData.Scope
 
 	newAT := RandomHex(32)
-	h.Store.StoreAccessToken(newAT, TokenData{ClientID: clientID, Scope: scope, ExpiresAt: now + 3600, CreatedAt: now})
+	if err := h.Store.StoreAccessToken(newAT, TokenData{ClientID: clientID, Scope: scope, ExpiresAt: now + 3600, CreatedAt: now}); err != nil {
+		writeOAuthJSON(w, http.StatusInternalServerError, map[string]any{"error": "server_error"})
+		return
+	}
 
 	newRT := RandomHex(32)
-	h.Store.StoreRefreshToken(newRT, TokenData{ClientID: clientID, Scope: scope, ExpiresAt: now + 30*24*3600, CreatedAt: now})
+	if err := h.Store.StoreRefreshToken(newRT, TokenData{ClientID: clientID, Scope: scope, ExpiresAt: now + 30*24*3600, CreatedAt: now}); err != nil {
+		writeOAuthJSON(w, http.StatusInternalServerError, map[string]any{"error": "server_error"})
+		return
+	}
 
 	writeOAuthJSON(w, http.StatusOK, map[string]any{
 		"access_token":  newAT,
@@ -375,17 +446,18 @@ func baseURL(r *http.Request) string {
 	return proto + "://" + r.Host
 }
 
+// clientIP extracts the client IP for rate limiting.
+// Uses RemoteAddr by default. When behind a trusted reverse proxy,
+// falls back to the first X-Forwarded-For entry (client-supplied IP).
+// For untrusted networks, configure your proxy to overwrite X-Forwarded-For.
 func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[len(parts)-1])
-	}
 	return r.RemoteAddr
 }
 
 func writeOAuthJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("mcpserver: failed to write OAuth JSON response: %v", err)
+	}
 }
-

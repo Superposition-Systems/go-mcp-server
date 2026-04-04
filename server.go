@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,6 +34,8 @@ type Server struct {
 	mcpPath     string
 	tools       ToolHandler
 	healthFunc  http.HandlerFunc
+	oauthDBPath string
+	routeOnce   sync.Once
 }
 
 // New creates a new MCP server with the given options.
@@ -51,11 +54,23 @@ func New(opts ...Option) *Server {
 			Scope:        "mcp:tools",
 			ResourcePath: "/mcp",
 		},
+		oauthDBPath: envDefault("OAUTH_DB_PATH", "/data/oauth.db"),
+		bearerToken: os.Getenv("BEARER_TOKEN"),
 	}
+	// Read PIN from env as default (can be overridden by WithPIN)
+	s.oauthConfig.PIN = os.Getenv("AUTH_PIN")
+
 	for _, opt := range opts {
 		opt(s)
 	}
 	return s
+}
+
+func envDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // Mux returns the underlying http.ServeMux for mounting application routes.
@@ -93,12 +108,13 @@ func (s *Server) ListenAndServe() error {
 		return fmt.Errorf("mcpserver: no ToolHandler registered — call RegisterTools() before ListenAndServe()")
 	}
 
-	// OAuth store
-	oauthDBPath := os.Getenv("OAUTH_DB_PATH")
-	if oauthDBPath == "" {
-		oauthDBPath = "/data/oauth.db"
+	// Resolve ResourcePath from mcpPath if not explicitly set via WithAuth
+	if s.oauthConfig.ResourcePath == "" {
+		s.oauthConfig.ResourcePath = s.mcpPath
 	}
-	oauthStore, err := auth.NewOAuthStore(oauthDBPath, s.oauthConfig.Scope)
+
+	// OAuth store
+	oauthStore, err := auth.NewOAuthStore(s.oauthDBPath, s.oauthConfig.Scope)
 	if err != nil {
 		return fmt.Errorf("mcpserver: oauth store: %w", err)
 	}
@@ -114,7 +130,9 @@ func (s *Server) ListenAndServe() error {
 		for {
 			select {
 			case <-ticker.C:
-				oauthStore.Cleanup()
+				if err := oauthStore.Cleanup(); err != nil {
+					log.Printf("mcpserver: cleanup error: %v", err)
+				}
 			case <-ctx.Done():
 				return
 			}
@@ -131,39 +149,34 @@ func (s *Server) ListenAndServe() error {
 			fmt.Fprint(w, `{"status":"ok"}`)
 		}
 	}
-	s.mux.HandleFunc("GET /health", healthHandler)
-	s.mux.HandleFunc("GET /healthz", healthHandler)
 
-	// MCP transport
-	s.mux.HandleFunc("POST "+s.mcpPath, TransportHandler(s.info, s.tools))
+	s.routeOnce.Do(func() {
+		s.mux.HandleFunc("GET /health", healthHandler)
+		s.mux.HandleFunc("GET /healthz", healthHandler)
+		s.mux.HandleFunc("POST "+s.mcpPath, TransportHandler(s.info, s.tools))
+		s.mux.HandleFunc("GET /.well-known/oauth-authorization-server", oauthHandler.Discovery)
+		s.mux.HandleFunc("GET /.well-known/oauth-protected-resource", oauthHandler.ProtectedResource)
+		s.mux.HandleFunc("POST /register", oauthHandler.Register)
+		s.mux.HandleFunc("GET /authorize", oauthHandler.AuthorizeGET)
+		s.mux.HandleFunc("POST /authorize", oauthHandler.AuthorizePOST)
+		s.mux.HandleFunc("POST /token", oauthHandler.Token)
+	})
 
-	// OAuth endpoints
-	s.mux.HandleFunc("GET /.well-known/oauth-authorization-server", oauthHandler.Discovery)
-	s.mux.HandleFunc("GET /.well-known/oauth-protected-resource", oauthHandler.ProtectedResource)
-	s.mux.HandleFunc("POST /register", oauthHandler.Register)
-	s.mux.HandleFunc("GET /authorize", oauthHandler.AuthorizeGET)
-	s.mux.HandleFunc("POST /authorize", oauthHandler.AuthorizePOST)
-	s.mux.HandleFunc("POST /token", oauthHandler.Token)
-
-	// Wrap with middleware: timeout + bearer auth
+	// Wrap with middleware: context-based timeout + bearer auth
 	bearerToken := s.bearerToken
-	if bearerToken == "" {
-		bearerToken = os.Getenv("BEARER_TOKEN")
-	}
-	authPIN := s.oauthConfig.PIN
-	if authPIN == "" {
-		authPIN = os.Getenv("AUTH_PIN")
-	}
-	s.oauthConfig.PIN = authPIN
 
 	handler := auth.BearerMiddleware(bearerToken, oauthStore, s.mcpPath)(
-		http.TimeoutHandler(s.mux, s.timeout, `{"error":"request timeout"}`),
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
+			defer cancel()
+			s.mux.ServeHTTP(w, r.WithContext(ctx))
+		}),
 	)
 
 	log.Printf("mcpserver: %s v%s listening on :%s", s.info.Name, s.info.Version, s.port)
 	log.Printf("mcpserver: MCP endpoint: %s", s.mcpPath)
 	log.Printf("mcpserver: bearer token configured: %v", bearerToken != "")
-	log.Printf("mcpserver: OAuth PIN configured: %v", authPIN != "")
+	log.Printf("mcpserver: OAuth PIN configured: %v", s.oauthConfig.PIN != "")
 
 	srv := &http.Server{
 		Addr:    ":" + s.port,
@@ -178,7 +191,9 @@ func (s *Server) ListenAndServe() error {
 		log.Println("mcpserver: shutting down...")
 		shutCtx, shutCancel := context.WithTimeout(context.Background(), s.drainTime)
 		defer shutCancel()
-		srv.Shutdown(shutCtx)
+		if err := srv.Shutdown(shutCtx); err != nil {
+			log.Printf("mcpserver: shutdown error: %v", err)
+		}
 	}()
 
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
@@ -197,7 +212,11 @@ func (s *Server) ListenAndServe() error {
 //	}
 func RunHealthCheck(port string) int {
 	resp, err := http.Get("http://localhost:" + port + "/health")
-	if err != nil || resp.StatusCode != 200 {
+	if err != nil {
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
 		return 1
 	}
 	return 0
