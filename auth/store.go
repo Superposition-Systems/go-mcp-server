@@ -246,17 +246,34 @@ func (s *OAuthStore) ConsumeAuthCode(code string) (*AuthCodeData, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	tx, err := s.db.Exec("BEGIN IMMEDIATE")
+	_ = tx
+	if err != nil {
+		return nil, fmt.Errorf("begin transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			s.db.Exec("ROLLBACK")
+		}
+	}()
+
 	row := s.db.QueryRow("SELECT client_id, redirect_uri, code_challenge, code_challenge_method, scope, created_at FROM auth_codes WHERE code = ?", code)
 	var d AuthCodeData
 	if err := row.Scan(&d.ClientID, &d.RedirectURI, &d.CodeChallenge, &d.CodeChallengeMethod, &d.Scope, &d.CreatedAt); err != nil {
 		return nil, err
 	}
 
-	// Check expiry before consuming
 	expired := time.Now().Unix()-d.CreatedAt > 300
 	if _, err := s.db.Exec("DELETE FROM auth_codes WHERE code = ?", code); err != nil {
 		return nil, fmt.Errorf("delete auth code: %w", err)
 	}
+
+	if _, err := s.db.Exec("COMMIT"); err != nil {
+		return nil, fmt.Errorf("commit transaction: %w", err)
+	}
+	committed = true
+
 	if expired {
 		return nil, fmt.Errorf("auth code expired")
 	}
@@ -277,6 +294,9 @@ func (s *OAuthStore) StoreAccessToken(token string, data TokenData) error {
 // VerifyAccessToken checks whether a token is valid and not expired.
 // Expired tokens are lazily deleted on verification.
 func (s *OAuthStore) VerifyAccessToken(token string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	var expiresAt int64
 	err := s.db.QueryRow("SELECT expires_at FROM access_tokens WHERE token = ?", token).Scan(&expiresAt)
 	if err != nil {
@@ -310,26 +330,55 @@ func (s *OAuthStore) ConsumeRefreshToken(token string) (*TokenData, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	tx, err := s.db.Exec("BEGIN IMMEDIATE")
+	_ = tx
+	if err != nil {
+		return nil, fmt.Errorf("begin transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			s.db.Exec("ROLLBACK")
+		}
+	}()
+
 	row := s.db.QueryRow("SELECT client_id, scope, expires_at, created_at FROM refresh_tokens WHERE token = ?", token)
 	var d TokenData
 	if err := row.Scan(&d.ClientID, &d.Scope, &d.ExpiresAt, &d.CreatedAt); err != nil {
 		return nil, err
 	}
-	// Check expiry before consuming
 	if time.Now().Unix() > d.ExpiresAt {
 		s.db.Exec("DELETE FROM refresh_tokens WHERE token = ?", token)
+		s.db.Exec("COMMIT")
+		committed = true
 		return nil, fmt.Errorf("refresh token expired")
 	}
 	if _, err := s.db.Exec("DELETE FROM refresh_tokens WHERE token = ?", token); err != nil {
 		return nil, fmt.Errorf("delete refresh token: %w", err)
 	}
+
+	if _, err := s.db.Exec("COMMIT"); err != nil {
+		return nil, fmt.Errorf("commit transaction: %w", err)
+	}
+	committed = true
 	return &d, nil
 }
 
 // StoreAuthRequest stores authorization request parameters server-side.
+// Limits the total number of pending auth requests to prevent DoS via
+// unbounded row insertion from unauthenticated callers.
 func (s *OAuthStore) StoreAuthRequest(requestID string, data map[string]string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	var count int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM auth_requests").Scan(&count); err != nil {
+		return fmt.Errorf("count auth requests: %w", err)
+	}
+	if count >= 10000 {
+		return fmt.Errorf("too many pending auth requests")
+	}
+
 	_, err := s.db.Exec(
 		`INSERT INTO auth_requests (request_id, client_id, redirect_uri, state, code_challenge, code_challenge_method, scope, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,

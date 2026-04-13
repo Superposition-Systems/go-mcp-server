@@ -81,10 +81,14 @@ func handlePost(w http.ResponseWriter, r *http.Request, info ServerInfo, tools T
 	case "tools/call":
 		handleToolsCall(w, r, req, tools)
 	default:
+		method := req.Method
+		if len(method) > 64 {
+			method = method[:64]
+		}
 		writeSSE(w, JSONRPCResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
-			Error:   &RPCError{Code: -32601, Message: fmt.Sprintf("Method not found: %s", req.Method)},
+			Error:   &RPCError{Code: -32601, Message: fmt.Sprintf("Method not found: %s", method)},
 		})
 	}
 }

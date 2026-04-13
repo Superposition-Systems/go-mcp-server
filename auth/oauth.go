@@ -454,16 +454,23 @@ func pkceVerify(codeVerifier, codeChallenge string) bool {
 }
 
 // baseURLFromConfig returns the canonical base URL from config, or derives
-// it from request headers (dev-only fallback).
+// it from request headers (dev-only fallback restricted to localhost).
 func baseURLFromConfig(cfg OAuthConfig, r *http.Request) string {
 	if cfg.ExternalURL != "" {
 		return strings.TrimRight(cfg.ExternalURL, "/")
 	}
-	proto := r.Header.Get("X-Forwarded-Proto")
-	if proto != "https" {
-		proto = "http"
+	// Dev-only fallback: only trust request-derived URLs for localhost.
+	// In production, ExternalURL must be set.
+	host := r.Host
+	hostname := host
+	if i := strings.LastIndex(host, ":"); i != -1 {
+		hostname = host[:i]
 	}
-	return proto + "://" + r.Host
+	if hostname != "localhost" && hostname != "127.0.0.1" && hostname != "::1" {
+		log.Printf("mcpserver: WARNING: ExternalURL not set and request host %q is not localhost — using http://localhost as fallback", host)
+		return "http://localhost"
+	}
+	return "http://" + host
 }
 
 // validateRedirectURI ensures a redirect URI uses https (or http://localhost for dev).
