@@ -220,8 +220,12 @@ Only paths matching the MCP endpoint (default `/mcp`) require authentication. Al
 
 ### Request Limits
 
-- **MCP endpoint**: 10 MB max request body (`http.MaxBytesReader`).
-- **Registration endpoint**: 1 MB max request body.
+| Endpoint | Max Body |
+|----------|----------|
+| `POST /mcp` | 10 MB |
+| `POST /register` | 1 MB |
+| `POST /authorize` | 64 KB |
+| `POST /token` | 64 KB |
 
 ### Server Timeouts
 
@@ -247,19 +251,41 @@ PIN rate limits clear on successful authentication. Registration rate limits cou
 
 In production, set `WithExternalURL("https://your-domain.com")` (or the `EXTERNAL_URL` env var). This hardcodes the OAuth issuer URL in discovery metadata, preventing Host header injection attacks.
 
-Without it, the server derives the issuer from request headers (`X-Forwarded-Proto` and `Host`) — suitable for local development only.
+Without it, the server only accepts requests from `localhost`, `127.0.0.1`, or `::1` — non-localhost requests receive a safe `http://localhost` fallback and a warning is logged. This makes misconfigured production deployments fail loudly rather than silently trusting attacker-controlled `Host` headers.
 
 ### Redirect URI Validation
 
-Client registration rejects redirect URIs that don't use `https://`. The exceptions are `http://localhost`, `http://127.0.0.1`, and `http://[::1]` for local development.
+Redirect URIs are validated at two points:
+
+1. **Registration** (`POST /register`): Rejects URIs that don't use `https://`. The exceptions are `http://localhost`, `http://127.0.0.1`, and `http://[::1]` for local development.
+2. **Authorization** (`GET /authorize`): Validates the requested `redirect_uri` against the client's registered URIs *before* rendering the consent page (per RFC 6749 §3.1.2.4). The same check is repeated at `POST /authorize` before issuing the redirect.
+
+The token endpoint (`POST /token`) also verifies that the `redirect_uri` matches the one from the original authorization request (per RFC 6749 §4.1.3), preventing authorization code interception.
+
+### Scope Enforcement
+
+OAuth access tokens carry a `scope` field that is enforced at the bearer middleware layer. Tokens whose scope doesn't match the server's configured scope (default `"mcp:tools"`) are rejected. Static bearer tokens and custom token validators bypass scope checks.
+
+### Resource Caps
+
+All database tables are bounded to prevent disk exhaustion from unauthenticated or compromised callers:
+
+| Resource | Cap |
+|----------|-----|
+| Registered clients | 1,000 |
+| Pending auth requests | 10,000 |
+| Access tokens | 50,000 |
+| Refresh tokens | 50,000 |
+| Rate limiter IP entries | 100,000 |
 
 ### Other Measures
 
 - All secret comparisons use `SafeEqual()` — SHA-256 hashing + `crypto/subtle.ConstantTimeCompare` to prevent timing and length-leak attacks.
 - Tokens generated with `crypto/rand` (32 bytes = 64 hex characters).
-- OAuth state stored in SQLite with WAL mode and foreign keys enabled.
+- OAuth state stored in SQLite with WAL mode, foreign keys, and `SetMaxOpenConns(1)` for single-writer safety.
+- All consume operations (auth codes, refresh tokens, auth requests) use database transactions for atomicity.
 - Expired tokens and codes cleaned up every 5 minutes in a background goroutine.
-- Max 1000 registered clients (configurable in `OAuthStore`).
+- Unknown JSON-RPC method names are truncated to 64 characters before inclusion in error messages.
 
 ## Transport
 

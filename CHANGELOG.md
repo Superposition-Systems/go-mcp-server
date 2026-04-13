@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.5.0] — 2026-04-13
+
+### Added
+- **Scope enforcement**: `VerifyAccessToken` now checks the token's `scope` against a required scope. `BearerMiddleware` passes the server's configured scope, so OAuth tokens with mismatched scopes are rejected.
+- **Resource caps**: Auth requests capped at 10,000 rows, access tokens and refresh tokens each capped at 50,000 rows. Prevents disk exhaustion from unauthenticated or compromised callers.
+- **Rate limiter IP cap**: Rate limiter map bounded at 100,000 distinct IPs; empty entries pruned on access. Prevents memory exhaustion from IP-spray attacks.
+- **Body limits on OAuth endpoints**: `POST /authorize` and `POST /token` now enforce 64 KB max request body via `http.MaxBytesReader`.
+- **Redirect URI validation at consent**: `GET /authorize` validates `redirect_uri` against client's registered URIs before rendering the consent page (RFC 6749 §3.1.2.4).
+- **Redirect URI verification at token exchange**: `POST /token` verifies `redirect_uri` matches the original authorization request (RFC 6749 §4.1.3), preventing authorization code interception.
+
+### Fixed
+- **Missing mutex in `VerifyAccessToken`**: Race condition on lazy-delete of expired tokens. Now acquires `s.mu.Lock()` like all other store methods.
+- **Non-atomic token consumption**: `ConsumeAuthCode`, `ConsumeRefreshToken`, and `GetAuthRequest` SELECT+DELETE pairs were not in database transactions. Replaced raw `db.Exec("BEGIN IMMEDIATE")` (which was non-functional with `database/sql` connection pool) with proper `db.Begin()` / `*sql.Tx`.
+- **SQLite connection safety**: Set `db.SetMaxOpenConns(1)` to match SQLite's single-writer model and ensure transactions are not split across pool connections.
+- **Nil dereference in `BearerMiddleware`**: Library consumers passing `nil` as the OAuth store would panic when falling through to `VerifyAccessToken`. Now guarded with a nil check.
+- **`baseURLFromConfig` localhost restriction**: Dev-only fallback now rejects non-localhost `Host` headers entirely (returns `http://localhost` with a warning log) instead of trusting attacker-controlled headers.
+- **Reflected method name in SSE error**: Attacker-controlled `req.Method` (up to 10 MB) was echoed verbatim in error responses. Now truncated to 64 characters.
+- **`GetAuthRequest` expired-path error swallowed**: Delete error on the expiry branch was silently ignored. Now handled within a transaction.
+- **Example app default credential**: Removed hardcoded `"test-token"` fallback. Example now requires `BEARER_TOKEN` or `AUTH_PIN` to be set.
+
+### Breaking Changes
+- `BearerMiddleware` signature changed: added `requiredScope string` parameter after `store`. Callers must pass a scope string (or `""` to skip enforcement).
+- `VerifyAccessToken` signature changed: added `requiredScope string` parameter. Callers must pass a scope string (or `""` to skip enforcement).
+
 ## [v0.4.0] — 2026-04-13
 
 ### Added
@@ -66,6 +90,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Graceful shutdown with configurable drain window.
 - Pure-Go SQLite via modernc.org/sqlite (CGO-free, distroless compatible).
 
+[v0.5.0]: https://github.com/Superposition-Systems/go-mcp-server/compare/v0.4.0...v0.5.0
 [v0.4.0]: https://github.com/Superposition-Systems/go-mcp-server/compare/v0.3.0...v0.4.0
 [v0.3.0]: https://github.com/Superposition-Systems/go-mcp-server/compare/v0.2.0...v0.3.0
 [v0.2.0]: https://github.com/Superposition-Systems/go-mcp-server/compare/v0.1.0...v0.2.0
