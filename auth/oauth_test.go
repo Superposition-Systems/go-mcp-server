@@ -139,11 +139,19 @@ func TestStoreTokenLifecycle(t *testing.T) {
 		t.Fatalf("StoreAccessToken failed: %v", err)
 	}
 
-	if !store.VerifyAccessToken(accessToken) {
-		t.Error("valid access token should verify")
+	if !store.VerifyAccessToken(accessToken, "mcp:tools") {
+		t.Error("valid access token should verify with matching scope")
 	}
 
-	if store.VerifyAccessToken("nonexistent-token") {
+	if store.VerifyAccessToken(accessToken, "wrong:scope") {
+		t.Error("access token with wrong scope should not verify")
+	}
+
+	if !store.VerifyAccessToken(accessToken, "") {
+		t.Error("access token should verify when requiredScope is empty")
+	}
+
+	if store.VerifyAccessToken("nonexistent-token", "") {
 		t.Error("nonexistent token should not verify")
 	}
 

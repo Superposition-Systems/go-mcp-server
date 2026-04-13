@@ -93,7 +93,7 @@ func newTestStore(t *testing.T) *OAuthStore {
 
 func TestBearerMiddlewareUnprotectedPassThrough(t *testing.T) {
 	store := newTestStore(t)
-	middleware := BearerMiddleware("secret-token", nil, store, "/mcp")
+	middleware := BearerMiddleware("secret-token", nil, store, "", "/mcp")
 
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -114,7 +114,7 @@ func TestBearerMiddlewareUnprotectedPassThrough(t *testing.T) {
 
 func TestBearerMiddlewareProtectedRequiresToken(t *testing.T) {
 	store := newTestStore(t)
-	middleware := BearerMiddleware("secret-token", nil, store, "/mcp")
+	middleware := BearerMiddleware("secret-token", nil, store, "", "/mcp")
 
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -134,7 +134,7 @@ func TestBearerMiddlewareProtectedRequiresToken(t *testing.T) {
 
 func TestBearerMiddlewareStaticToken(t *testing.T) {
 	store := newTestStore(t)
-	middleware := BearerMiddleware("my-secret", nil, store, "/mcp")
+	middleware := BearerMiddleware("my-secret", nil, store, "", "/mcp")
 
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -155,7 +155,7 @@ func TestBearerMiddlewareStaticToken(t *testing.T) {
 
 func TestBearerMiddlewareInvalidToken(t *testing.T) {
 	store := newTestStore(t)
-	middleware := BearerMiddleware("my-secret", nil, store, "/mcp")
+	middleware := BearerMiddleware("my-secret", nil, store, "", "/mcp")
 
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -175,7 +175,7 @@ func TestBearerMiddlewareInvalidToken(t *testing.T) {
 
 func TestBearerMiddlewareOAuthToken(t *testing.T) {
 	store := newTestStore(t)
-	middleware := BearerMiddleware("static-token", nil, store, "/mcp")
+	middleware := BearerMiddleware("static-token", nil, store, "mcp:tools", "/mcp")
 
 	// Store an OAuth access token
 	now := time.Now().Unix()
@@ -209,7 +209,7 @@ func TestBearerMiddlewareOAuthToken(t *testing.T) {
 
 func TestBearerMiddlewareMultipleProtectedPaths(t *testing.T) {
 	store := newTestStore(t)
-	middleware := BearerMiddleware("tok", nil, store, "/mcp", "/api")
+	middleware := BearerMiddleware("tok", nil, store, "", "/mcp", "/api")
 
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

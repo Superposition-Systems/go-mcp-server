@@ -166,7 +166,7 @@ func (s *Server) ListenAndServe() error {
 
 	// Wrap with middleware: context-based timeout + bearer auth
 	var handler http.Handler
-	handler = auth.BearerMiddleware(s.bearerToken, s.tokenValidator, oauthStore, s.mcpPath)(
+	handler = auth.BearerMiddleware(s.bearerToken, s.tokenValidator, oauthStore, s.oauthConfig.Scope, s.mcpPath)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
 			defer cancel()

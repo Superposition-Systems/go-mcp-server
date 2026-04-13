@@ -298,14 +298,16 @@ func (s *OAuthStore) StoreAccessToken(token string, data TokenData) error {
 	return err
 }
 
-// VerifyAccessToken checks whether a token is valid and not expired.
+// VerifyAccessToken checks whether a token is valid, not expired, and
+// carries the required scope. If requiredScope is empty, scope is not checked.
 // Expired tokens are lazily deleted on verification.
-func (s *OAuthStore) VerifyAccessToken(token string) bool {
+func (s *OAuthStore) VerifyAccessToken(token string, requiredScope string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	var expiresAt int64
-	err := s.db.QueryRow("SELECT expires_at FROM access_tokens WHERE token = ?", token).Scan(&expiresAt)
+	var scope string
+	err := s.db.QueryRow("SELECT expires_at, scope FROM access_tokens WHERE token = ?", token).Scan(&expiresAt, &scope)
 	if err != nil {
 		if err != sql.ErrNoRows {
 			log.Printf("mcpserver: failed to verify access token: %v", err)
@@ -316,6 +318,9 @@ func (s *OAuthStore) VerifyAccessToken(token string) bool {
 		if _, err := s.db.Exec("DELETE FROM access_tokens WHERE token = ?", token); err != nil {
 			log.Printf("mcpserver: failed to delete expired token: %v", err)
 		}
+		return false
+	}
+	if requiredScope != "" && scope != requiredScope {
 		return false
 	}
 	return true
@@ -400,23 +405,34 @@ func (s *OAuthStore) StoreAuthRequest(requestID string, data map[string]string) 
 func (s *OAuthStore) GetAuthRequest(requestID string) (map[string]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback() // no-op after Commit
+
 	var clientID, redirectURI, state, codeChallenge, codeChallengeMethod, scope string
 	var createdAt int64
-	err := s.db.QueryRow(
+	err = tx.QueryRow(
 		"SELECT client_id, redirect_uri, state, code_challenge, code_challenge_method, scope, created_at FROM auth_requests WHERE request_id = ?",
 		requestID,
 	).Scan(&clientID, &redirectURI, &state, &codeChallenge, &codeChallengeMethod, &scope, &createdAt)
 	if err != nil {
 		return nil, err
 	}
-	// Check expiry before consuming (10 minutes)
-	if time.Now().Unix()-createdAt > 600 {
-		s.db.Exec("DELETE FROM auth_requests WHERE request_id = ?", requestID)
-		return nil, fmt.Errorf("auth request expired")
-	}
-	// Delete after reading (single-use)
-	if _, err := s.db.Exec("DELETE FROM auth_requests WHERE request_id = ?", requestID); err != nil {
+
+	// Always delete (expired or not) to prevent reuse
+	if _, err := tx.Exec("DELETE FROM auth_requests WHERE request_id = ?", requestID); err != nil {
 		return nil, fmt.Errorf("delete auth request: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit transaction: %w", err)
+	}
+
+	// Check expiry after atomic consume
+	if time.Now().Unix()-createdAt > 600 {
+		return nil, fmt.Errorf("auth request expired")
 	}
 	return map[string]string{
 		"client_id":             clientID,

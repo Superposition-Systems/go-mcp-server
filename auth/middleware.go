@@ -78,10 +78,13 @@ func (rl *RateLimiter) prune(ip string) {
 // For apps needing custom token validation (e.g. multiple tokens with
 // different scopes), use WithTokenValidator instead of WithBearerToken.
 //
+// requiredScope is the OAuth scope that access tokens must carry (e.g.
+// "mcp:tools"). Pass "" to skip scope enforcement.
+//
 // protectedPaths lists path prefixes that require authentication (e.g. "/mcp").
 // All other paths pass through without auth — use your reverse proxy (e.g.
 // Traefik with qa-gate) to protect those routes at the infrastructure layer.
-func BearerMiddleware(bearerToken string, tokenValidator func(string) bool, store *OAuthStore, protectedPaths ...string) func(http.Handler) http.Handler {
+func BearerMiddleware(bearerToken string, tokenValidator func(string) bool, store *OAuthStore, requiredScope string, protectedPaths ...string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			path := r.URL.Path
@@ -121,7 +124,7 @@ func BearerMiddleware(bearerToken string, tokenValidator func(string) bool, stor
 			}
 
 			// OAuth access token (claude.ai)
-			if store.VerifyAccessToken(token) {
+			if store != nil && store.VerifyAccessToken(token, requiredScope) {
 				next.ServeHTTP(w, r)
 				return
 			}
