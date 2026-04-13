@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"net/http"
 	"time"
 
 	"github.com/Superposition-Systems/go-mcp-server/auth"
@@ -49,6 +50,18 @@ func WithBearerToken(token string) Option {
 	return func(s *Server) { s.bearerToken = token }
 }
 
+// WithTokenValidator sets a custom function to validate bearer tokens.
+// The function receives the raw token (after stripping "Bearer ") and
+// returns true if the token should be accepted.
+//
+// This is checked before the static bearer token and OAuth, so it can
+// be used to accept multiple tokens, implement scoped auth, or delegate
+// to an external auth service. Combine with WithMiddleware to tag the
+// request context with scope metadata before validation runs.
+func WithTokenValidator(fn func(token string) bool) Option {
+	return func(s *Server) { s.tokenValidator = fn }
+}
+
 // WithMCPPath sets the MCP endpoint path (default "/mcp").
 // ResourcePath is resolved lazily in ListenAndServe from mcpPath,
 // so this option can be used in any order with WithAuth.
@@ -88,5 +101,15 @@ func WithConsent(title, description string) Option {
 	return func(s *Server) {
 		s.oauthConfig.ConsentTitle = title
 		s.oauthConfig.ConsentDescription = description
+	}
+}
+
+// WithMiddleware sets an outer middleware that wraps the entire handler chain
+// (including bearer auth). This runs before any auth check, so it can inspect
+// the raw Authorization header to tag the request context with application-
+// specific metadata (e.g. auth scope levels).
+func WithMiddleware(mw func(http.Handler) http.Handler) Option {
+	return func(s *Server) {
+		s.outerMiddleware = mw
 	}
 }

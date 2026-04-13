@@ -30,12 +30,14 @@ type Server struct {
 	drainTime   time.Duration
 	oauthStore  *auth.OAuthStore
 	oauthConfig auth.OAuthConfig
-	bearerToken string
+	bearerToken    string
+	tokenValidator func(string) bool
 	mcpPath     string
 	tools       ToolHandler
 	healthFunc  http.HandlerFunc
 	oauthDBPath string
 	routeOnce   sync.Once
+	outerMiddleware func(http.Handler) http.Handler // applied outside bearer auth
 }
 
 // New creates a new MCP server with the given options.
@@ -163,9 +165,8 @@ func (s *Server) ListenAndServe() error {
 	})
 
 	// Wrap with middleware: context-based timeout + bearer auth
-	bearerToken := s.bearerToken
-
-	handler := auth.BearerMiddleware(bearerToken, oauthStore, s.mcpPath)(
+	var handler http.Handler
+	handler = auth.BearerMiddleware(s.bearerToken, s.tokenValidator, oauthStore, s.mcpPath)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
 			defer cancel()
@@ -173,9 +174,15 @@ func (s *Server) ListenAndServe() error {
 		}),
 	)
 
+	// Apply outer middleware (e.g. auth scope tagging) — runs before bearer auth
+	if s.outerMiddleware != nil {
+		handler = s.outerMiddleware(handler)
+	}
+
 	log.Printf("mcpserver: %s v%s listening on :%s", s.info.Name, s.info.Version, s.port)
 	log.Printf("mcpserver: MCP endpoint: %s", s.mcpPath)
-	log.Printf("mcpserver: bearer token configured: %v", bearerToken != "")
+	log.Printf("mcpserver: bearer token configured: %v", s.bearerToken != "")
+	log.Printf("mcpserver: token validator configured: %v", s.tokenValidator != nil)
 	log.Printf("mcpserver: OAuth PIN configured: %v", s.oauthConfig.PIN != "")
 
 	srv := &http.Server{

@@ -65,10 +65,13 @@ func (rl *RateLimiter) prune(ip string) {
 // on specified paths. It supports dual-mode auth: a static bearer token
 // (for CLI tools like Claude Code) and OAuth access tokens (for claude.ai).
 //
+// For apps needing custom token validation (e.g. multiple tokens with
+// different scopes), use WithTokenValidator instead of WithBearerToken.
+//
 // protectedPaths lists path prefixes that require authentication (e.g. "/mcp").
 // All other paths pass through without auth — use your reverse proxy (e.g.
 // Traefik with qa-gate) to protect those routes at the infrastructure layer.
-func BearerMiddleware(bearerToken string, store *OAuthStore, protectedPaths ...string) func(http.Handler) http.Handler {
+func BearerMiddleware(bearerToken string, tokenValidator func(string) bool, store *OAuthStore, protectedPaths ...string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			path := r.URL.Path
@@ -94,6 +97,12 @@ func BearerMiddleware(bearerToken string, store *OAuthStore, protectedPaths ...s
 			}
 
 			token := authHeader[7:]
+
+			// Custom token validator (supports multi-token, scoped auth, etc.)
+			if tokenValidator != nil && tokenValidator(token) {
+				next.ServeHTTP(w, r)
+				return
+			}
 
 			// Static bearer token (CLI tools)
 			if bearerToken != "" && SafeEqual(token, bearerToken) {
