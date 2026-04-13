@@ -87,6 +87,10 @@ func NewOAuthStore(dbPath string, scope string) (*OAuthStore, error) {
 		return nil, fmt.Errorf("enable foreign keys: %w", err)
 	}
 
+	// SQLite supports only one writer at a time. Pinning to a single connection
+	// ensures db.BeginTx transactions are not split across pool connections.
+	db.SetMaxOpenConns(1)
+
 	store := &OAuthStore{db: db, maxClients: 1000, scope: scope}
 	if err := store.createTables(); err != nil {
 		db.Close()
@@ -246,33 +250,26 @@ func (s *OAuthStore) ConsumeAuthCode(code string) (*AuthCodeData, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tx, err := s.db.Exec("BEGIN IMMEDIATE")
-	_ = tx
+	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, fmt.Errorf("begin transaction: %w", err)
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			s.db.Exec("ROLLBACK")
-		}
-	}()
+	defer tx.Rollback() // no-op after Commit
 
-	row := s.db.QueryRow("SELECT client_id, redirect_uri, code_challenge, code_challenge_method, scope, created_at FROM auth_codes WHERE code = ?", code)
+	row := tx.QueryRow("SELECT client_id, redirect_uri, code_challenge, code_challenge_method, scope, created_at FROM auth_codes WHERE code = ?", code)
 	var d AuthCodeData
 	if err := row.Scan(&d.ClientID, &d.RedirectURI, &d.CodeChallenge, &d.CodeChallengeMethod, &d.Scope, &d.CreatedAt); err != nil {
 		return nil, err
 	}
 
 	expired := time.Now().Unix()-d.CreatedAt > 300
-	if _, err := s.db.Exec("DELETE FROM auth_codes WHERE code = ?", code); err != nil {
+	if _, err := tx.Exec("DELETE FROM auth_codes WHERE code = ?", code); err != nil {
 		return nil, fmt.Errorf("delete auth code: %w", err)
 	}
 
-	if _, err := s.db.Exec("COMMIT"); err != nil {
+	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit transaction: %w", err)
 	}
-	committed = true
 
 	if expired {
 		return nil, fmt.Errorf("auth code expired")
@@ -281,9 +278,19 @@ func (s *OAuthStore) ConsumeAuthCode(code string) (*AuthCodeData, error) {
 }
 
 // StoreAccessToken persists an access token.
+// Caps total access tokens at 50,000 to prevent unbounded growth.
 func (s *OAuthStore) StoreAccessToken(token string, data TokenData) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	var count int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM access_tokens").Scan(&count); err != nil {
+		return fmt.Errorf("count access tokens: %w", err)
+	}
+	if count >= 50000 {
+		return fmt.Errorf("too many active access tokens")
+	}
+
 	_, err := s.db.Exec(
 		"INSERT INTO access_tokens (token, client_id, scope, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
 		token, data.ClientID, data.Scope, data.ExpiresAt, data.CreatedAt,
@@ -315,9 +322,19 @@ func (s *OAuthStore) VerifyAccessToken(token string) bool {
 }
 
 // StoreRefreshToken persists a refresh token.
+// Caps total refresh tokens at 50,000 to prevent unbounded growth.
 func (s *OAuthStore) StoreRefreshToken(token string, data TokenData) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	var count int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM refresh_tokens").Scan(&count); err != nil {
+		return fmt.Errorf("count refresh tokens: %w", err)
+	}
+	if count >= 50000 {
+		return fmt.Errorf("too many active refresh tokens")
+	}
+
 	_, err := s.db.Exec(
 		"INSERT INTO refresh_tokens (token, client_id, scope, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
 		token, data.ClientID, data.Scope, data.ExpiresAt, data.CreatedAt,
@@ -330,37 +347,28 @@ func (s *OAuthStore) ConsumeRefreshToken(token string) (*TokenData, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tx, err := s.db.Exec("BEGIN IMMEDIATE")
-	_ = tx
+	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, fmt.Errorf("begin transaction: %w", err)
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			s.db.Exec("ROLLBACK")
-		}
-	}()
+	defer tx.Rollback() // no-op after Commit
 
-	row := s.db.QueryRow("SELECT client_id, scope, expires_at, created_at FROM refresh_tokens WHERE token = ?", token)
+	row := tx.QueryRow("SELECT client_id, scope, expires_at, created_at FROM refresh_tokens WHERE token = ?", token)
 	var d TokenData
 	if err := row.Scan(&d.ClientID, &d.Scope, &d.ExpiresAt, &d.CreatedAt); err != nil {
 		return nil, err
 	}
-	if time.Now().Unix() > d.ExpiresAt {
-		s.db.Exec("DELETE FROM refresh_tokens WHERE token = ?", token)
-		s.db.Exec("COMMIT")
-		committed = true
-		return nil, fmt.Errorf("refresh token expired")
-	}
-	if _, err := s.db.Exec("DELETE FROM refresh_tokens WHERE token = ?", token); err != nil {
+	// Always delete the token (expired or not) to prevent reuse
+	if _, err := tx.Exec("DELETE FROM refresh_tokens WHERE token = ?", token); err != nil {
 		return nil, fmt.Errorf("delete refresh token: %w", err)
 	}
-
-	if _, err := s.db.Exec("COMMIT"); err != nil {
+	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit transaction: %w", err)
 	}
-	committed = true
+
+	if time.Now().Unix() > d.ExpiresAt {
+		return nil, fmt.Errorf("refresh token expired")
+	}
 	return &d, nil
 }
 

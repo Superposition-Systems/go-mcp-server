@@ -17,12 +17,13 @@
 //
 //	curl http://localhost:8080/api/v1/greet?name=World
 //
-// Test MCP (requires Bearer token):
+// Test MCP (requires Bearer token — set BEARER_TOKEN or AUTH_PIN env var):
 //
+//	BEARER_TOKEN=my-secret go run .
 //	curl -X POST http://localhost:8080/mcp \
 //	  -H "Content-Type: application/json" \
 //	  -H "Accept: application/json, text/event-stream" \
-//	  -H "Authorization: Bearer test-token" \
+//	  -H "Authorization: Bearer my-secret" \
 //	  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 package main
 
@@ -44,6 +45,11 @@ func main() {
 	}
 
 	// 1. Create server
+	bearerToken := os.Getenv("BEARER_TOKEN")
+	if bearerToken == "" && os.Getenv("AUTH_PIN") == "" {
+		log.Fatal("example: BEARER_TOKEN or AUTH_PIN must be set (refusing to start with no authentication)")
+	}
+
 	srv := mcpserver.New(
 		mcpserver.WithName("example-mcp"),
 		mcpserver.WithVersion("0.1.0"),
@@ -51,7 +57,7 @@ func main() {
 		mcpserver.WithPort(envOr("PORT", "8080")),
 		mcpserver.WithPIN(os.Getenv("AUTH_PIN")),             // AUTH_PIN env var required for production
 		mcpserver.WithExternalURL(os.Getenv("EXTERNAL_URL")), // e.g. "https://mcp.example.com" — required for production
-		mcpserver.WithBearerToken(envOr("BEARER_TOKEN", "test-token")),
+		mcpserver.WithBearerToken(bearerToken),
 		mcpserver.WithConsent("Example MCP", "Enter the PIN to connect."),
 	)
 

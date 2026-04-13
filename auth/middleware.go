@@ -13,6 +13,7 @@ type RateLimiter struct {
 	attempts    map[string][]time.Time
 	maxAttempts int
 	window      time.Duration
+	maxIPs      int // upper bound on tracked IPs to prevent memory exhaustion
 }
 
 // NewRateLimiter creates a rate limiter that allows maxAttempts within
@@ -22,6 +23,7 @@ func NewRateLimiter(maxAttempts int, windowSeconds int) *RateLimiter {
 		attempts:    make(map[string][]time.Time),
 		maxAttempts: maxAttempts,
 		window:      time.Duration(windowSeconds) * time.Second,
+		maxIPs:      100000,
 	}
 }
 
@@ -38,6 +40,10 @@ func (rl *RateLimiter) RecordFailure(ip string) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	rl.prune(ip)
+	// Prevent unbounded memory growth from IP-spray attacks
+	if len(rl.attempts) >= rl.maxIPs {
+		return
+	}
 	rl.attempts[ip] = append(rl.attempts[ip], time.Now())
 }
 
@@ -58,7 +64,11 @@ func (rl *RateLimiter) prune(ip string) {
 			n++
 		}
 	}
-	rl.attempts[ip] = entries[:n]
+	if n == 0 {
+		delete(rl.attempts, ip)
+	} else {
+		rl.attempts[ip] = entries[:n]
+	}
 }
 
 // BearerMiddleware creates HTTP middleware that requires a valid Bearer token

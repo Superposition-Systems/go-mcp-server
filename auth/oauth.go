@@ -171,6 +171,28 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate redirect_uri against registered URIs before rendering consent (RFC 6749 §3.1.2.4)
+	reqRedirectURI := q.Get("redirect_uri")
+	if len(client.RedirectURIs) == 0 {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Client has no registered redirect URIs."))
+		return
+	}
+	uriFound := false
+	for _, u := range client.RedirectURIs {
+		if u == reqRedirectURI {
+			uriFound = true
+			break
+		}
+	}
+	if !uriFound {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Invalid redirect_uri."))
+		return
+	}
+
 	// Validate scope against allowed scope
 	reqScope := q.Get("scope")
 	if reqScope != "" && reqScope != h.config.Scope {
@@ -202,6 +224,7 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 
 // AuthorizePOST validates the PIN and issues an authorization code.
 func (h *OAuthHandler) AuthorizePOST(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024) // 64 KB — generous for a PIN form
 	if err := r.ParseForm(); err != nil {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusBadRequest)
@@ -310,6 +333,7 @@ func (h *OAuthHandler) AuthorizePOST(w http.ResponseWriter, r *http.Request) {
 
 // Token handles authorization code exchange and refresh token rotation.
 func (h *OAuthHandler) Token(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024) // 64 KB
 	if err := r.ParseForm(); err != nil {
 		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request"})
 		return
@@ -345,6 +369,12 @@ func (h *OAuthHandler) exchangeAuthCode(w http.ResponseWriter, r *http.Request) 
 	}
 	if codeData.ClientID != clientID {
 		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant"})
+		return
+	}
+
+	// RFC 6749 §4.1.3: redirect_uri must match the one from the authorization request
+	if r.FormValue("redirect_uri") != codeData.RedirectURI {
+		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant", "error_description": "redirect_uri mismatch"})
 		return
 	}
 
