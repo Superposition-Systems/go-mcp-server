@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
 	"time"
 
 	"github.com/google/uuid"
@@ -26,6 +27,12 @@ type OAuthConfig struct {
 	// ResourcePath is the MCP endpoint path suffix for RFC 9728 metadata
 	// (e.g. "/mcp"). Defaults to "/mcp" if empty.
 	ResourcePath string
+
+	// ExternalURL is the canonical public URL of this server (e.g.
+	// "https://my-mcp.example.com"). Used as the OAuth issuer and to build
+	// all metadata endpoint URLs. If empty, the server falls back to
+	// deriving the URL from request headers (suitable for local dev only).
+	ExternalURL string
 
 	// ConsentTitle is the title shown on the PIN consent page.
 	ConsentTitle string
@@ -67,7 +74,7 @@ func NewOAuthHandler(store *OAuthStore, cfg OAuthConfig) *OAuthHandler {
 
 // Discovery returns RFC 8414 OAuth authorization server metadata.
 func (h *OAuthHandler) Discovery(w http.ResponseWriter, r *http.Request) {
-	base := baseURL(r)
+	base := baseURLFromConfig(h.config, r)
 	writeOAuthJSON(w, http.StatusOK, map[string]any{
 		"issuer":                                base,
 		"authorization_endpoint":                base + "/authorize",
@@ -83,7 +90,7 @@ func (h *OAuthHandler) Discovery(w http.ResponseWriter, r *http.Request) {
 
 // ProtectedResource returns RFC 9728 protected resource metadata.
 func (h *OAuthHandler) ProtectedResource(w http.ResponseWriter, r *http.Request) {
-	base := baseURL(r)
+	base := baseURLFromConfig(h.config, r)
 	writeOAuthJSON(w, http.StatusOK, map[string]any{
 		"resource":                 base + h.config.ResourcePath,
 		"authorization_servers":    []string{base},
@@ -99,7 +106,9 @@ func (h *OAuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		writeOAuthJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too_many_requests"})
 		return
 	}
+	h.RegLimiter.RecordFailure(ip) // count every attempt, not just failures
 
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB
 	var metadata map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&metadata); err != nil {
 		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request"})
@@ -110,6 +119,12 @@ func (h *OAuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	if len(uris) == 0 {
 		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request", "error_description": "redirect_uris required"})
 		return
+	}
+	for _, uri := range uris {
+		if err := validateRedirectURI(uri); err != nil {
+			writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request", "error_description": err.Error()})
+			return
+		}
 	}
 
 	client, err := h.Store.RegisterClient(metadata)
@@ -438,12 +453,32 @@ func pkceVerify(codeVerifier, codeChallenge string) bool {
 	return SafeEqual(computed, codeChallenge)
 }
 
-func baseURL(r *http.Request) string {
+// baseURLFromConfig returns the canonical base URL from config, or derives
+// it from request headers (dev-only fallback).
+func baseURLFromConfig(cfg OAuthConfig, r *http.Request) string {
+	if cfg.ExternalURL != "" {
+		return strings.TrimRight(cfg.ExternalURL, "/")
+	}
 	proto := r.Header.Get("X-Forwarded-Proto")
-	if proto == "" {
+	if proto != "https" {
 		proto = "http"
 	}
 	return proto + "://" + r.Host
+}
+
+// validateRedirectURI ensures a redirect URI uses https (or http://localhost for dev).
+func validateRedirectURI(uri string) error {
+	u, err := url.ParseRequestURI(uri)
+	if err != nil {
+		return fmt.Errorf("invalid redirect_uri: %w", err)
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1") {
+		return nil
+	}
+	return fmt.Errorf("redirect_uri must use https (or http://localhost for development)")
 }
 
 // clientIP extracts the client IP for rate limiting.

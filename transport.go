@@ -58,6 +58,7 @@ func handlePost(w http.ResponseWriter, r *http.Request, info ServerInfo, tools T
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10 MB
 	var req JSONRPCRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeSSE(w, JSONRPCResponse{

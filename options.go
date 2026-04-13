@@ -96,6 +96,13 @@ func WithPIN(pin string) Option {
 	return func(s *Server) { s.oauthConfig.PIN = pin }
 }
 
+// WithExternalURL sets the canonical public URL of this server (e.g.
+// "https://my-mcp.example.com"). Used as the OAuth issuer and for all
+// metadata endpoint URLs. Required for production deployments.
+func WithExternalURL(url string) Option {
+	return func(s *Server) { s.oauthConfig.ExternalURL = url }
+}
+
 // WithConsent sets the title and description for the OAuth PIN consent page.
 func WithConsent(title, description string) Option {
 	return func(s *Server) {

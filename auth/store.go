@@ -251,11 +251,13 @@ func (s *OAuthStore) ConsumeAuthCode(code string) (*AuthCodeData, error) {
 	if err := row.Scan(&d.ClientID, &d.RedirectURI, &d.CodeChallenge, &d.CodeChallengeMethod, &d.Scope, &d.CreatedAt); err != nil {
 		return nil, err
 	}
+
+	// Check expiry before consuming
+	expired := time.Now().Unix()-d.CreatedAt > 300
 	if _, err := s.db.Exec("DELETE FROM auth_codes WHERE code = ?", code); err != nil {
 		return nil, fmt.Errorf("delete auth code: %w", err)
 	}
-
-	if time.Now().Unix()-d.CreatedAt > 300 {
+	if expired {
 		return nil, fmt.Errorf("auth code expired")
 	}
 	return &d, nil

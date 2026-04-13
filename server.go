@@ -186,8 +186,12 @@ func (s *Server) ListenAndServe() error {
 	log.Printf("mcpserver: OAuth PIN configured: %v", s.oauthConfig.PIN != "")
 
 	srv := &http.Server{
-		Addr:    ":" + s.port,
-		Handler: handler,
+		Addr:              ":" + s.port,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      s.timeout + 10*time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Graceful shutdown

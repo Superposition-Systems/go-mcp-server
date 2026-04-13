@@ -49,7 +49,8 @@ func main() {
 		mcpserver.WithVersion("0.1.0"),
 		mcpserver.WithInstructions("An example MCP server that greets people."),
 		mcpserver.WithPort(envOr("PORT", "8080")),
-		mcpserver.WithPIN(os.Getenv("AUTH_PIN")), // AUTH_PIN env var required for production
+		mcpserver.WithPIN(os.Getenv("AUTH_PIN")),             // AUTH_PIN env var required for production
+		mcpserver.WithExternalURL(os.Getenv("EXTERNAL_URL")), // e.g. "https://mcp.example.com" — required for production
 		mcpserver.WithBearerToken(envOr("BEARER_TOKEN", "test-token")),
 		mcpserver.WithConsent("Example MCP", "Enter the PIN to connect."),
 	)
