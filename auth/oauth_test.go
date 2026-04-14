@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
@@ -192,6 +194,39 @@ func TestStoreTokenLifecycle(t *testing.T) {
 	_, err = store.ConsumeRefreshToken(refreshToken, "client-1")
 	if err == nil {
 		t.Error("second ConsumeRefreshToken should fail (rotation)")
+	}
+}
+
+func TestDiscoveryRefusesWithoutExternalURLForNonLocalhost(t *testing.T) {
+	store := newOAuthTestStore(t)
+	h := NewOAuthHandler(store, OAuthConfig{Scope: "mcp:tools"})
+
+	// Non-localhost Host, no ExternalURL -> must 500.
+	req := httptest.NewRequest("GET", "http://prod.example.com/.well-known/oauth-authorization-server", nil)
+	req.Host = "prod.example.com"
+	rec := httptest.NewRecorder()
+	h.Discovery(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("non-localhost without ExternalURL: expected 500, got %d", rec.Code)
+	}
+
+	// Localhost Host, no ExternalURL -> OK fallback.
+	req = httptest.NewRequest("GET", "http://localhost:8080/.well-known/oauth-authorization-server", nil)
+	req.Host = "localhost:8080"
+	rec = httptest.NewRecorder()
+	h.Discovery(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("localhost without ExternalURL: expected 200, got %d", rec.Code)
+	}
+
+	// Non-localhost WITH ExternalURL -> OK.
+	h2 := NewOAuthHandler(store, OAuthConfig{Scope: "mcp:tools", ExternalURL: "https://prod.example.com"})
+	req = httptest.NewRequest("GET", "http://prod.example.com/.well-known/oauth-authorization-server", nil)
+	req.Host = "prod.example.com"
+	rec = httptest.NewRecorder()
+	h2.Discovery(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("non-localhost with ExternalURL: expected 200, got %d", rec.Code)
 	}
 }
 

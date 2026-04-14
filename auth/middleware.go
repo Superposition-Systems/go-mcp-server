@@ -71,6 +71,30 @@ func (rl *RateLimiter) prune(ip string) {
 	}
 }
 
+// PruneAll drops every tracked IP whose entire attempt window has
+// expired. Intended to be called periodically (e.g. every few minutes
+// from a background goroutine) so the map does not approach maxIPs
+// under sustained low-volume traffic. When maxIPs is reached,
+// RecordFailure silently no-ops — without PruneAll the map can stay at
+// capacity indefinitely, letting new attackers bypass the limiter.
+func (rl *RateLimiter) PruneAll() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	cutoff := time.Now().Add(-rl.window)
+	for ip, entries := range rl.attempts {
+		alive := false
+		for _, t := range entries {
+			if t.After(cutoff) {
+				alive = true
+				break
+			}
+		}
+		if !alive {
+			delete(rl.attempts, ip)
+		}
+	}
+}
+
 // parseBearer extracts the token from an RFC 6750-compliant Authorization
 // header. The scheme match is case-insensitive; the token must be
 // non-empty and must not itself contain whitespace — RFC 6750 §2.1

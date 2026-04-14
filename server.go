@@ -148,10 +148,27 @@ func (s *Server) ListenAndServe() error {
 	defer oauthStore.Close()
 	s.oauthStore = oauthStore
 
-	// OAuth cleanup goroutine
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Capture whether a PIN was configured before zeroing it — used
+	// below for the startup warning banner.
+	pinAtHandlerBuild := s.oauthConfig.PIN
+	oauthHandler := auth.NewOAuthHandler(oauthStore, s.oauthConfig)
+	// The OAuth handler holds its own copy of the PIN; clear it from
+	// the Server struct so panics/log dumps of the Server don't expose it.
+	s.oauthConfig.PIN = ""
+
+	// Cleanup goroutine: prunes expired DB rows and sweeps the
+	// in-memory rate-limiter maps so they cannot stay at capacity under
+	// sustained adversarial traffic. Wrapped in panic recovery so a
+	// SQLite driver panic cannot kill the server process.
 	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("mcpserver: cleanup goroutine panicked: %v", rec)
+			}
+		}()
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -160,16 +177,17 @@ func (s *Server) ListenAndServe() error {
 				if err := oauthStore.Cleanup(); err != nil {
 					log.Printf("mcpserver: cleanup error: %v", err)
 				}
+				oauthHandler.PINLimiter.PruneAll()
+				oauthHandler.RegLimiter.PruneAll()
+				oauthHandler.AuthorizeLimiter.PruneAll()
+				if s.elevation != nil {
+					s.elevation.PruneAttemptLimiter()
+				}
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
-
-	oauthHandler := auth.NewOAuthHandler(oauthStore, s.oauthConfig)
-	// The OAuth handler holds its own copy of the PIN; clear it from
-	// the Server struct so panics/log dumps of the Server don't expose it.
-	s.oauthConfig.PIN = ""
 
 	// Health
 	healthHandler := s.healthFunc
@@ -226,7 +244,31 @@ func (s *Server) ListenAndServe() error {
 	log.Printf("mcpserver: MCP endpoint: %s", s.mcpPath)
 	log.Printf("mcpserver: bearer token configured: %v", s.bearerToken != "")
 	log.Printf("mcpserver: token validator configured: %v", s.tokenValidator != nil)
-	log.Printf("mcpserver: OAuth PIN configured: %v", s.oauthConfig.PIN != "")
+	pinConfigured := pinAtHandlerBuild != ""
+	log.Printf("mcpserver: OAuth PIN configured: %v", pinConfigured)
+	if !pinConfigured {
+		// OAuth endpoints are registered but the consent PIN is empty.
+		// AuthorizePOST will reject every attempt with 500 "Server PIN
+		// not configured". For static-bearer-only deployments this is
+		// the intended state; flagging it prominently so operators
+		// don't discover the misconfiguration on the first real
+		// authorization attempt.
+		log.Printf("mcpserver: =========================================================")
+		log.Printf("mcpserver: WARNING: OAuth endpoints are mounted but no consent PIN is")
+		log.Printf("mcpserver: configured. Set AUTH_PIN env or use WithPIN() to enable")
+		log.Printf("mcpserver: OAuth consent. Static-bearer-only deployments may ignore")
+		log.Printf("mcpserver: this warning; deployments expecting to serve claude.ai or")
+		log.Printf("mcpserver: other OAuth clients will fail every PIN submission.")
+		log.Printf("mcpserver: =========================================================")
+	}
+	if s.oauthConfig.ExternalURL == "" {
+		log.Printf("mcpserver: =========================================================")
+		log.Printf("mcpserver: WARNING: WithExternalURL is not set. OAuth discovery will")
+		log.Printf("mcpserver: only serve metadata to localhost clients. Non-localhost")
+		log.Printf("mcpserver: discovery requests will receive HTTP 500. Set")
+		log.Printf("mcpserver: WithExternalURL(\"https://...\") for production.")
+		log.Printf("mcpserver: =========================================================")
+	}
 
 	srv := &http.Server{
 		Addr:              ":" + s.port,

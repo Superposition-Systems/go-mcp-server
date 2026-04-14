@@ -497,6 +497,14 @@ func NewElevation(password *PasswordStore, grants *GrantStore, ttl time.Duration
 // yet initialized). Exposed so tests and advanced callers can inspect it.
 func (e *Elevation) PasswordStore() *PasswordStore { return e.password }
 
+// PruneAttemptLimiter drops fully-expired entries from the
+// per-session elevation attempt limiter. Safe to call periodically.
+func (e *Elevation) PruneAttemptLimiter() {
+	if e != nil && e.attemptLimiter != nil {
+		e.attemptLimiter.PruneAll()
+	}
+}
+
 // GrantStore returns the underlying grant store.
 func (e *Elevation) GrantStore() *GrantStore { return e.grants }
 

@@ -180,6 +180,12 @@ func (s *OAuthStore) createTables() error {
 			scope TEXT DEFAULT '',
 			created_at INTEGER NOT NULL
 		);
+		-- Indexes on the columns Cleanup scans, so the periodic
+		-- DELETE-WHERE does not degrade to a full table scan at cap.
+		CREATE INDEX IF NOT EXISTS idx_auth_codes_created_at     ON auth_codes(created_at);
+		CREATE INDEX IF NOT EXISTS idx_access_tokens_expires_at  ON access_tokens(expires_at);
+		CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires_at ON refresh_tokens(expires_at);
+		CREATE INDEX IF NOT EXISTS idx_auth_requests_created_at  ON auth_requests(created_at);
 	`)
 	return err
 }
@@ -261,22 +267,35 @@ func (s *OAuthStore) GetClient(clientID string) (*ClientData, error) {
 	return &c, nil
 }
 
+// dummyClientSecretHash is a fixed 64-character hex string used as the
+// comparand on the unknown-client branch of VerifyClientSecret. Using a
+// distinct, real-looking dummy (rather than comparing a value to itself)
+// prevents a clever compiler or CPU short-path from recognizing the
+// self-compare as trivially true and skipping the expected work.
+const dummyClientSecretHash = "0000000000000000000000000000000000000000000000000000000000000000"
+
 // VerifyClientSecret returns true if the presented secret matches the
-// hash stored for clientID. The work done is identical regardless of
-// whether clientID is registered, so timing does not disclose which
-// client IDs exist. The comparison is constant-time.
+// hash stored for clientID.
+//
+// CPU-level work is equalized across the known-vs-unknown-client_id
+// branches: hashSecret runs unconditionally, and the constant-time
+// compare runs in both branches against a value of the same length. A
+// small timing gap remains from the DB SELECT itself (index hit vs miss
+// on an indexed PRIMARY KEY is microseconds) — that is a property of
+// SQLite, not of this code, and is orders of magnitude smaller than the
+// hashSecret work it now follows. For fully uniform timing a
+// full-register approach (always select + always ignore) would be
+// needed; we have judged the remaining gap acceptable.
 func (s *OAuthStore) VerifyClientSecret(clientID, secret string) bool {
-	// Compute the presented hash unconditionally so the unknown-client
-	// branch pays the same CPU cost as the wrong-secret branch.
+	// Hash unconditionally so both branches pay the hash cost.
 	presented := hashSecret(secret)
 
 	var storedHash string
 	err := s.db.QueryRow("SELECT client_secret FROM clients WHERE client_id = ?", clientID).Scan(&storedHash)
 	if err != nil {
-		// Burn the same constant-time compare so both code paths take
-		// the same time; `presented` is a 64-char hex string so the
-		// comparison length matches a real stored_hash.
-		subtle.ConstantTimeCompare([]byte(presented), []byte(presented))
+		// Burn the same constant-time compare against a distinct
+		// dummy so the compiler cannot fold self-compares to true.
+		_ = subtle.ConstantTimeCompare([]byte(presented), []byte(dummyClientSecretHash))
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(presented), []byte(storedHash)) == 1
@@ -296,8 +315,11 @@ func (s *OAuthStore) StoreAuthCode(code string, data AuthCodeData) error {
 	return err
 }
 
-// ConsumeAuthCode atomically reads and deletes an auth code. Returns nil
-// if the code doesn't exist or has expired (300-second TTL).
+// ConsumeAuthCode atomically reads and deletes an auth code. Returns
+// (nil, err) if the code doesn't exist (err will be sql.ErrNoRows) or
+// has expired (300-second TTL). A successful consume returns the
+// decoded AuthCodeData with a nil error. Callers must check err, not
+// just the pointer.
 func (s *OAuthStore) ConsumeAuthCode(code string) (*AuthCodeData, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -549,25 +571,58 @@ func (s *OAuthStore) GetAuthRequest(requestID string) (map[string]string, error)
 	}, nil
 }
 
-// Cleanup removes expired auth codes, access tokens, refresh tokens, and auth requests.
-// Call this periodically (e.g. every 5 minutes) from a background goroutine.
+// cleanupBatchSize caps how many rows a single DELETE statement removes
+// so the per-batch lock hold on s.mu stays bounded regardless of how
+// many rows are expired. Cleanup releases and re-acquires s.mu between
+// batches so auth requests are not blocked for seconds on large sweeps.
+const cleanupBatchSize = 1000
+
+// Cleanup removes expired auth codes, access tokens, refresh tokens,
+// and auth requests in small batches, releasing the store mutex
+// between batches. Call periodically (e.g. every 5 minutes) from a
+// background goroutine.
 func (s *OAuthStore) Cleanup() error {
 	now := time.Now().Unix()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, err := s.db.Exec("DELETE FROM auth_codes WHERE created_at < ?", now-300); err != nil {
+	if err := s.cleanupBatched(
+		"DELETE FROM auth_codes WHERE rowid IN (SELECT rowid FROM auth_codes WHERE created_at < ? LIMIT ?)",
+		now-300,
+	); err != nil {
 		return fmt.Errorf("cleanup auth codes: %w", err)
 	}
-	if _, err := s.db.Exec("DELETE FROM access_tokens WHERE expires_at < ?", now); err != nil {
+	if err := s.cleanupBatched(
+		"DELETE FROM access_tokens WHERE rowid IN (SELECT rowid FROM access_tokens WHERE expires_at < ? LIMIT ?)",
+		now,
+	); err != nil {
 		return fmt.Errorf("cleanup access tokens: %w", err)
 	}
-	if _, err := s.db.Exec("DELETE FROM refresh_tokens WHERE expires_at < ?", now); err != nil {
+	if err := s.cleanupBatched(
+		"DELETE FROM refresh_tokens WHERE rowid IN (SELECT rowid FROM refresh_tokens WHERE expires_at < ? LIMIT ?)",
+		now,
+	); err != nil {
 		return fmt.Errorf("cleanup refresh tokens: %w", err)
 	}
-	if _, err := s.db.Exec("DELETE FROM auth_requests WHERE created_at < ?", now-600); err != nil {
+	if err := s.cleanupBatched(
+		"DELETE FROM auth_requests WHERE rowid IN (SELECT rowid FROM auth_requests WHERE created_at < ? LIMIT ?)",
+		now-600,
+	); err != nil {
 		return fmt.Errorf("cleanup auth requests: %w", err)
 	}
 	return nil
+}
+
+func (s *OAuthStore) cleanupBatched(query string, threshold int64) error {
+	for {
+		s.mu.Lock()
+		res, err := s.db.Exec(query, threshold, cleanupBatchSize)
+		s.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		if n < cleanupBatchSize {
+			return nil
+		}
+	}
 }
 
 // RandomHex generates n random bytes and returns them as a hex string.

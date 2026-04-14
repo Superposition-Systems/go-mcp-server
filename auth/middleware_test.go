@@ -60,6 +60,21 @@ func TestRateLimiterWindowExpiry(t *testing.T) {
 	}
 }
 
+func TestRateLimiterPruneAll(t *testing.T) {
+	rl := NewRateLimiter(5, 1) // 1-second window
+	rl.RecordFailure("a")
+	rl.RecordFailure("b")
+	rl.RecordFailure("c")
+	if got := len(rl.attempts); got != 3 {
+		t.Fatalf("expected 3 tracked IPs, got %d", got)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	rl.PruneAll()
+	if got := len(rl.attempts); got != 0 {
+		t.Fatalf("PruneAll should have dropped all expired entries, still have %d", got)
+	}
+}
+
 func TestRateLimiterClear(t *testing.T) {
 	rl := NewRateLimiter(2, 60)
 	ip := "10.0.0.2"

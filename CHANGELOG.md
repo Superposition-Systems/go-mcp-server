@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.7.2] — 2026-04-14
+
+Third-pass audit follow-up. No critical vulnerabilities; a mix of
+real hardening, operator-visibility improvements, and
+documentation-vs-implementation cleanup.
+
+### Changed — behavior
+- **OAuth discovery returns HTTP 500** when `WithExternalURL` is not set and the request Host isn't localhost, instead of silently advertising `http://localhost/authorize`. Clients now get a clear error; operators see a concrete log line. (A2)
+- **`VerifyClientSecret` miss-path dummy compare** now targets a distinct 64-char dummy hash rather than comparing the presented hash to itself. Prevents a clever compiler from folding self-compares to trivially-true and defeating the timing equalization. (A1)
+- **Startup warning banners** for two high-impact misconfigurations: OAuth mounted with empty PIN, and `ExternalURL` unset. Neither refuses to start (both have legitimate local-dev / static-bearer-only modes). (A3)
+- **`RateLimiter.PruneAll()`** is now called every 5 min from the cleanup goroutine for all four limiters (PIN, Reg, Authorize, Elevation). Prevents the 100k-IP cap from sticking at capacity under sustained traffic, which would silently allow new attackers through. (A4)
+- **`OAuthStore.Cleanup` uses batched `DELETE ... LIMIT 1000`** releasing `s.mu` between batches. Prior behavior could stall the auth path for seconds under high row counts. Added indexes on `expires_at` / `created_at` columns so the per-batch delete stays fast. (A5)
+- **Cleanup goroutine wrapped in panic recovery** so a SQLite driver panic cannot kill the server process. (A6)
+
+### Fixed — docstrings
+- `VerifyClientSecret` comment no longer overstates the timing guarantee — documents the small remaining DB-SELECT gap. (A7)
+- `pkceVerify` comment correctly describes that one input is the raw verifier, not a pre-computed digest. (A9)
+- `ConsumeAuthCode` godoc documents `(nil, err)` on miss/expiry, not `(nil, nil)`. Callers who check only the pointer would misbehave. (A10)
+- `_elevate` tool description stops calling itself a "no-op" in bootstrap mode (it returns a structured success payload, which LLM clients may otherwise skip). (A8)
+
+### Documentation
+- README rate-limit table adds `GET /authorize` (60/hr) and per-session elevation limiter rows, plus the 100k-IP cap and `WithTrustedProxyCIDRs` expectation. (A11)
+- README `ExternalURL` section updated to describe the new 500-on-non-localhost behavior. (A2 docs)
+- README "secret comparisons" section corrected — not all are `SafeEqual`, several use `subtle.ConstantTimeCompare` directly on fixed-length digests (which is correct). (A12)
+
+### Tests
+- `TestDiscoveryRefusesWithoutExternalURLForNonLocalhost` covers the three metadata-serving branches.
+- `TestRateLimiterPruneAll` covers the new background-prune path.
+
 ## [v0.7.1] — 2026-04-14
 
 Second-pass audit follow-up: fixes stragglers found after the v0.7.0

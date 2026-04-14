@@ -126,8 +126,9 @@ func (e *elevationTools) ListTools() []ToolDef {
 			Name: e.elevate,
 			Description: "Elevate this session to write permissions for the configured TTL " +
 				"by providing the elevation password. In bootstrap mode (no password " +
-				"configured) this tool is a no-op — all authenticated sessions are " +
-				"already elevated.",
+				"configured) this tool returns immediately with elevated=true and " +
+				"bootstrap=true — every authenticated session is already elevated " +
+				"until set_elevation_password closes the window.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{

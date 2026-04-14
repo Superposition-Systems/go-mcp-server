@@ -102,7 +102,10 @@ func NewOAuthHandler(store *OAuthStore, cfg OAuthConfig) *OAuthHandler {
 
 // Discovery returns RFC 8414 OAuth authorization server metadata.
 func (h *OAuthHandler) Discovery(w http.ResponseWriter, r *http.Request) {
-	base := baseURLFromConfig(h.config, r)
+	base, ok := baseURLOrError(h.config, r, w)
+	if !ok {
+		return
+	}
 	writeOAuthJSON(w, http.StatusOK, map[string]any{
 		"issuer":                                base,
 		"authorization_endpoint":                base + "/authorize",
@@ -118,7 +121,10 @@ func (h *OAuthHandler) Discovery(w http.ResponseWriter, r *http.Request) {
 
 // ProtectedResource returns RFC 9728 protected resource metadata.
 func (h *OAuthHandler) ProtectedResource(w http.ResponseWriter, r *http.Request) {
-	base := baseURLFromConfig(h.config, r)
+	base, ok := baseURLOrError(h.config, r, w)
+	if !ok {
+		return
+	}
 	writeOAuthJSON(w, http.StatusOK, map[string]any{
 		"resource":                 base + h.config.ResourcePath,
 		"authorization_servers":    []string{base},
@@ -550,33 +556,60 @@ func SafeEqual(a, b string) bool {
 }
 
 // pkceVerify computes the S256 challenge from the verifier and compares
-// it to the stored challenge in constant time. Both inputs are already
-// fixed-length base64url-encoded SHA-256 digests, so direct constant-time
-// byte comparison (no re-hash) is correct and semantically clearer.
+// it to the stored challenge in constant time.
+//
+// codeVerifier is the raw PKCE verifier sent by the client; this
+// function hashes it to base64url(SHA-256) and compares the result
+// against codeChallenge (itself already a stored base64url SHA-256
+// digest). Direct subtle.ConstantTimeCompare on the two digest-encoded
+// strings is correct here — they are fixed-length after this function's
+// hash, so no length oracle exists.
 func pkceVerify(codeVerifier, codeChallenge string) bool {
 	h := sha256.Sum256([]byte(codeVerifier))
 	computed := base64.RawURLEncoding.EncodeToString(h[:])
 	return subtle.ConstantTimeCompare([]byte(computed), []byte(codeChallenge)) == 1
 }
 
-// baseURLFromConfig returns the canonical base URL from config, or derives
-// it from request headers (dev-only fallback restricted to localhost).
+// baseURLFromConfig returns the canonical base URL from config, or
+// derives it from request headers for localhost-only development. For
+// non-localhost requests without ExternalURL it returns an empty
+// string — callers must treat that as an error (see baseURLOrError).
+//
+// Never silently falls back to "http://localhost" for non-localhost
+// requests: that old behavior caused OAuth discovery to advertise
+// localhost URLs to real clients, breaking the flow without any
+// client-visible signal.
 func baseURLFromConfig(cfg OAuthConfig, r *http.Request) string {
 	if cfg.ExternalURL != "" {
 		return strings.TrimRight(cfg.ExternalURL, "/")
 	}
-	// Dev-only fallback: only trust request-derived URLs for localhost.
-	// In production, ExternalURL must be set.
 	host := r.Host
 	hostname := host
 	if i := strings.LastIndex(host, ":"); i != -1 {
 		hostname = host[:i]
 	}
-	if hostname != "localhost" && hostname != "127.0.0.1" && hostname != "::1" {
-		log.Printf("mcpserver: WARNING: ExternalURL not set and request host %q is not localhost — using http://localhost as fallback", host)
-		return "http://localhost"
+	if hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1" {
+		return "http://" + host
 	}
-	return "http://" + host
+	return ""
+}
+
+// baseURLOrError is the metadata-endpoint wrapper around
+// baseURLFromConfig. When no canonical base URL can be determined, it
+// writes a 500 response explaining the required configuration and
+// returns ok=false. Metadata clients therefore get a clear error
+// instead of silently-poisoned "http://localhost" discovery data.
+func baseURLOrError(cfg OAuthConfig, r *http.Request, w http.ResponseWriter) (string, bool) {
+	base := baseURLFromConfig(cfg, r)
+	if base == "" {
+		log.Printf("mcpserver: rejecting OAuth metadata request from host %q — WithExternalURL(...) is required in production", r.Host)
+		writeOAuthJSON(w, http.StatusInternalServerError, map[string]any{
+			"error":             "server_error",
+			"error_description": "OAuth ExternalURL is not configured; server cannot produce discovery metadata for non-localhost hosts",
+		})
+		return "", false
+	}
+	return base, true
 }
 
 // validateRedirectURI enforces RFC 6749 §3.1.2: https (or localhost http

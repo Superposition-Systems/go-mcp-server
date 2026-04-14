@@ -310,15 +310,19 @@ All connections enforce timeouts to prevent slowloris and connection exhaustion:
 | Endpoint | Limit | Window |
 |----------|-------|--------|
 | `POST /authorize` (PIN attempts) | 5 attempts per IP | 15 minutes |
+| `GET /authorize` (consent page views) | 60 per IP | 1 hour |
 | `POST /register` (client registration) | 10 attempts per IP | 1 hour |
+| Elevation password attempts (per session) | 5 attempts per token hash | 15 minutes |
 
-PIN rate limits clear on successful authentication. Registration rate limits count all attempts regardless of outcome.
+PIN rate limits clear on successful authentication. Registration and authorize-GET rate limits count all attempts regardless of outcome. All limiters have a 100k-IP capacity cap and are periodically pruned (every 5 min) so idle entries do not stick and allow bypass.
+
+When running behind a reverse proxy, use `WithTrustedProxyCIDRs(...)` so the limiters key on the real client IP rather than the proxy's IP — otherwise all clients share one bucket.
 
 ### ExternalURL
 
 In production, set `WithExternalURL("https://your-domain.com")` (or the `EXTERNAL_URL` env var). This hardcodes the OAuth issuer URL in discovery metadata, preventing Host header injection attacks.
 
-Without it, the server only accepts requests from `localhost`, `127.0.0.1`, or `::1` — non-localhost requests receive a safe `http://localhost` fallback and a warning is logged. This makes misconfigured production deployments fail loudly rather than silently trusting attacker-controlled `Host` headers.
+Without it, OAuth discovery (`/.well-known/oauth-authorization-server` and `/.well-known/oauth-protected-resource`) will serve metadata only for `localhost`, `127.0.0.1`, or `::1` requests. Non-localhost requests receive `HTTP 500` with a clear error message instead of silently-poisoned "http://localhost" metadata. This makes misconfigured production deployments fail loudly rather than silently trusting attacker-controlled `Host` headers.
 
 ### Redirect URI Validation
 
@@ -347,7 +351,7 @@ All database tables are bounded to prevent disk exhaustion from unauthenticated 
 
 ### Other Measures
 
-- All secret comparisons use `SafeEqual()` — SHA-256 hashing + `crypto/subtle.ConstantTimeCompare` to prevent timing and length-leak attacks.
+- All secret comparisons are constant-time: `SafeEqual()` (SHA-256 + `crypto/subtle.ConstantTimeCompare`, length-hiding) for raw-secret compares, and direct `crypto/subtle.ConstantTimeCompare` on fixed-length digests where the inputs are already hashed (`VerifyClientSecret`, `pkceVerify`, `verifyPassword`).
 - Tokens generated with `crypto/rand` (32 bytes = 64 hex characters).
 - OAuth state stored in SQLite with WAL mode, foreign keys, and `SetMaxOpenConns(1)` for single-writer safety.
 - All consume operations (auth codes, refresh tokens, auth requests) use database transactions for atomicity.
