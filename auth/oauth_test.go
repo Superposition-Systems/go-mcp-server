@@ -83,8 +83,15 @@ func TestStoreRegisterAndGetClient(t *testing.T) {
 	if got.ClientID != client.ClientID {
 		t.Errorf("client_id mismatch: %q vs %q", got.ClientID, client.ClientID)
 	}
-	if got.ClientSecret != client.ClientSecret {
-		t.Errorf("client_secret mismatch")
+	if got.ClientSecret != "" {
+		t.Errorf("GetClient must not return the raw client_secret, got %q", got.ClientSecret)
+	}
+	// The secret is verified against its stored hash.
+	if !store.VerifyClientSecret(client.ClientID, client.ClientSecret) {
+		t.Errorf("VerifyClientSecret should accept the just-issued secret")
+	}
+	if store.VerifyClientSecret(client.ClientID, "wrong-secret") {
+		t.Errorf("VerifyClientSecret must reject an incorrect secret")
 	}
 }
 
@@ -167,7 +174,13 @@ func TestStoreTokenLifecycle(t *testing.T) {
 		t.Fatalf("StoreRefreshToken failed: %v", err)
 	}
 
-	data, err := store.ConsumeRefreshToken(refreshToken)
+	// Client binding is enforced BEFORE deletion: a wrong client_id must
+	// not burn the token.
+	if _, err := store.ConsumeRefreshToken(refreshToken, "impostor"); err == nil {
+		t.Error("ConsumeRefreshToken with wrong client_id should fail")
+	}
+
+	data, err := store.ConsumeRefreshToken(refreshToken, "client-1")
 	if err != nil {
 		t.Fatalf("ConsumeRefreshToken failed: %v", err)
 	}
@@ -176,8 +189,28 @@ func TestStoreTokenLifecycle(t *testing.T) {
 	}
 
 	// Second consume should fail (rotation)
-	_, err = store.ConsumeRefreshToken(refreshToken)
+	_, err = store.ConsumeRefreshToken(refreshToken, "client-1")
 	if err == nil {
 		t.Error("second ConsumeRefreshToken should fail (rotation)")
+	}
+}
+
+func TestScopeContains(t *testing.T) {
+	cases := []struct {
+		granted, required string
+		want              bool
+	}{
+		{"", "", true},
+		{"mcp:tools", "", true},
+		{"mcp:tools", "mcp:tools", true},
+		{"mcp:tools mcp:read", "mcp:tools", true},
+		{"mcp:tools mcp:read", "mcp:read mcp:tools", true},
+		{"mcp:tools", "mcp:read", false},
+		{"", "mcp:tools", false},
+	}
+	for _, c := range cases {
+		if got := ScopeContains(c.granted, c.required); got != c.want {
+			t.Errorf("ScopeContains(%q,%q)=%v want %v", c.granted, c.required, got, c.want)
+		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,7 +22,8 @@ type OAuthConfig struct {
 	// PIN is the authorization PIN users enter on the consent page.
 	PIN string
 
-	// Scope is the OAuth scope string (e.g. "mcp:tools").
+	// Scope is the OAuth scope string (e.g. "mcp:tools"). Multi-value
+	// scopes may be expressed as a space-delimited list.
 	Scope string
 
 	// ResourcePath is the MCP endpoint path suffix for RFC 9728 metadata
@@ -39,15 +41,31 @@ type OAuthConfig struct {
 
 	// ConsentDescription is the description shown on the PIN consent page.
 	ConsentDescription string
+
+	// AllowMissingState, when true, permits authorization requests that
+	// omit the `state` parameter. Default (false) rejects them — OAuth
+	// 2.1 treats state as the primary CSRF countermeasure, and PKCE
+	// alone is not a complete substitute against cross-site request
+	// forgery on the redirect leg. Enable only if you must interoperate
+	// with legacy clients that do not send state.
+	AllowMissingState bool
+
+	// TrustedProxyCIDRs lists CIDR ranges whose X-Forwarded-For header
+	// the server may trust when determining the client IP for rate
+	// limiting. Leave empty to use r.RemoteAddr directly (appropriate
+	// when no proxy is in front of this server).
+	TrustedProxyCIDRs []string
 }
 
 // OAuthHandler serves all OAuth 2.0 endpoints: discovery, registration,
 // authorization (PIN consent), and token exchange.
 type OAuthHandler struct {
-	Store      *OAuthStore
-	config     OAuthConfig
-	PINLimiter *RateLimiter
-	RegLimiter *RateLimiter
+	Store            *OAuthStore
+	config           OAuthConfig
+	PINLimiter       *RateLimiter
+	RegLimiter       *RateLimiter
+	AuthorizeLimiter *RateLimiter
+	trustedNets      []*net.IPNet
 }
 
 // NewOAuthHandler creates an OAuth handler with the given store and config.
@@ -64,12 +82,22 @@ func NewOAuthHandler(store *OAuthStore, cfg OAuthConfig) *OAuthHandler {
 	if cfg.ConsentDescription == "" {
 		cfg.ConsentDescription = "Enter the authorization PIN to connect."
 	}
-	return &OAuthHandler{
-		Store:      store,
-		config:     cfg,
-		PINLimiter: NewRateLimiter(5, 900),
-		RegLimiter: NewRateLimiter(10, 3600),
+	h := &OAuthHandler{
+		Store:            store,
+		config:           cfg,
+		PINLimiter:       NewRateLimiter(5, 900),
+		RegLimiter:       NewRateLimiter(10, 3600),
+		AuthorizeLimiter: NewRateLimiter(60, 3600), // bound auth-request store DoS
 	}
+	for _, c := range cfg.TrustedProxyCIDRs {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			log.Printf("mcpserver: ignoring invalid trusted proxy CIDR %q: %v", c, err)
+			continue
+		}
+		h.trustedNets = append(h.trustedNets, n)
+	}
+	return h
 }
 
 // Discovery returns RFC 8414 OAuth authorization server metadata.
@@ -94,14 +122,14 @@ func (h *OAuthHandler) ProtectedResource(w http.ResponseWriter, r *http.Request)
 	writeOAuthJSON(w, http.StatusOK, map[string]any{
 		"resource":                 base + h.config.ResourcePath,
 		"authorization_servers":    []string{base},
-		"scopes_supported":        []string{h.config.Scope},
+		"scopes_supported":         []string{h.config.Scope},
 		"bearer_methods_supported": []string{"header"},
 	})
 }
 
 // Register handles RFC 7591 dynamic client registration.
 func (h *OAuthHandler) Register(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
+	ip := h.clientIP(r)
 	if h.RegLimiter.IsRateLimited(ip) {
 		writeOAuthJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too_many_requests"})
 		return
@@ -138,6 +166,17 @@ func (h *OAuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 
 // AuthorizeGET renders the PIN consent page.
 func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
+	// Rate-limit per-IP to bound the server-side auth-request store
+	// against unauthenticated flood DoS.
+	ip := h.clientIP(r)
+	if h.AuthorizeLimiter.IsRateLimited(ip) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Too many authorization requests from your address."))
+		return
+	}
+	h.AuthorizeLimiter.RecordFailure(ip)
+
 	q := r.URL.Query()
 	if q.Get("response_type") != "code" {
 		w.Header().Set("Content-Type", "text/html")
@@ -146,7 +185,7 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// PKCE is mandatory — require code_challenge
+	// PKCE is mandatory — require code_challenge.
 	if q.Get("code_challenge") == "" {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusBadRequest)
@@ -154,12 +193,28 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate code_challenge_method
+	// Validate code_challenge_method. Normalize absent/empty method to
+	// "S256" so the downstream record always stores a concrete value
+	// (and never silently enables a future code path that branches on
+	// an empty method).
 	ccm := q.Get("code_challenge_method")
-	if ccm != "" && ccm != "S256" {
+	if ccm == "" {
+		ccm = "S256"
+	}
+	if ccm != "S256" {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Unsupported code_challenge_method. Only S256 is supported."))
+		return
+	}
+
+	// OAuth 2.1: require `state` unless explicitly allowed off. PKCE
+	// plus state form defense-in-depth against CSRF on the redirect.
+	state := q.Get("state")
+	if state == "" && !h.config.AllowMissingState {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "state parameter is required."))
 		return
 	}
 
@@ -193,9 +248,9 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate scope against allowed scope
+	// Validate requested scope is a subset of the configured scope.
 	reqScope := q.Get("scope")
-	if reqScope != "" && reqScope != h.config.Scope {
+	if reqScope != "" && !ScopeContains(h.config.Scope, reqScope) {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Invalid scope."))
@@ -206,11 +261,11 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 	requestID := uuid.New().String()
 	if err := h.Store.StoreAuthRequest(requestID, map[string]string{
 		"client_id":             q.Get("client_id"),
-		"redirect_uri":         q.Get("redirect_uri"),
-		"state":                q.Get("state"),
-		"code_challenge":       q.Get("code_challenge"),
-		"code_challenge_method": q.Get("code_challenge_method"),
-		"scope":                q.Get("scope"),
+		"redirect_uri":          reqRedirectURI,
+		"state":                 state,
+		"code_challenge":        q.Get("code_challenge"),
+		"code_challenge_method": ccm,
+		"scope":                 reqScope,
 	}); err != nil {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -241,7 +296,7 @@ func (h *OAuthHandler) AuthorizePOST(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := clientIP(r)
+	ip := h.clientIP(r)
 	if h.PINLimiter.IsRateLimited(ip) {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -356,8 +411,7 @@ func (h *OAuthHandler) exchangeAuthCode(w http.ResponseWriter, r *http.Request) 
 	code := r.FormValue("code")
 	codeVerifier := r.FormValue("code_verifier")
 
-	client, err := h.Store.GetClient(clientID)
-	if err != nil || client == nil || !SafeEqual(clientSecret, client.ClientSecret) {
+	if !h.Store.VerifyClientSecret(clientID, clientSecret) {
 		writeOAuthJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid_client"})
 		return
 	}
@@ -383,7 +437,7 @@ func (h *OAuthHandler) exchangeAuthCode(w http.ResponseWriter, r *http.Request) 
 		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant", "error_description": "code_challenge required"})
 		return
 	}
-	if codeData.CodeChallengeMethod != "" && codeData.CodeChallengeMethod != "S256" {
+	if codeData.CodeChallengeMethod != "S256" {
 		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant", "error_description": "unsupported code_challenge_method"})
 		return
 	}
@@ -397,10 +451,10 @@ func (h *OAuthHandler) exchangeAuthCode(w http.ResponseWriter, r *http.Request) 
 	}
 
 	now := time.Now().Unix()
+	// Scope the issued token to exactly what the client requested.
+	// Do NOT widen to the server default — a client that asked for no
+	// scope must not receive a maximally-privileged token.
 	scope := codeData.Scope
-	if scope == "" {
-		scope = h.config.Scope
-	}
 
 	accessToken := RandomHex(32)
 	if err := h.Store.StoreAccessToken(accessToken, TokenData{ClientID: clientID, Scope: scope, ExpiresAt: now + 3600, CreatedAt: now}); err != nil {
@@ -428,18 +482,16 @@ func (h *OAuthHandler) exchangeRefreshToken(w http.ResponseWriter, r *http.Reque
 	clientSecret := r.FormValue("client_secret")
 	refreshToken := r.FormValue("refresh_token")
 
-	client, err := h.Store.GetClient(clientID)
-	if err != nil || client == nil || !SafeEqual(clientSecret, client.ClientSecret) {
+	if !h.Store.VerifyClientSecret(clientID, clientSecret) {
 		writeOAuthJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid_client"})
 		return
 	}
 
-	tokenData, err := h.Store.ConsumeRefreshToken(refreshToken)
+	// ConsumeRefreshToken verifies the client binding BEFORE deleting so
+	// that a wrong-client request cannot burn the legitimate client's
+	// token.
+	tokenData, err := h.Store.ConsumeRefreshToken(refreshToken, clientID)
 	if err != nil || tokenData == nil {
-		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant"})
-		return
-	}
-	if tokenData.ClientID != clientID {
 		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant"})
 		return
 	}
@@ -477,10 +529,14 @@ func SafeEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare(ha[:], hb[:]) == 1
 }
 
+// pkceVerify computes the S256 challenge from the verifier and compares
+// it to the stored challenge in constant time. Both inputs are already
+// fixed-length base64url-encoded SHA-256 digests, so direct constant-time
+// byte comparison (no re-hash) is correct and semantically clearer.
 func pkceVerify(codeVerifier, codeChallenge string) bool {
 	h := sha256.Sum256([]byte(codeVerifier))
 	computed := base64.RawURLEncoding.EncodeToString(h[:])
-	return SafeEqual(computed, codeChallenge)
+	return subtle.ConstantTimeCompare([]byte(computed), []byte(codeChallenge)) == 1
 }
 
 // baseURLFromConfig returns the canonical base URL from config, or derives
@@ -503,11 +559,18 @@ func baseURLFromConfig(cfg OAuthConfig, r *http.Request) string {
 	return "http://" + host
 }
 
-// validateRedirectURI ensures a redirect URI uses https (or http://localhost for dev).
+// validateRedirectURI enforces RFC 6749 §3.1.2: https (or localhost http
+// for dev), and no query string or fragment component.
 func validateRedirectURI(uri string) error {
 	u, err := url.ParseRequestURI(uri)
 	if err != nil {
 		return fmt.Errorf("invalid redirect_uri: %w", err)
+	}
+	if u.Fragment != "" || strings.Contains(uri, "#") {
+		return fmt.Errorf("redirect_uri must not contain a fragment")
+	}
+	if u.RawQuery != "" {
+		return fmt.Errorf("redirect_uri must not contain a query string")
 	}
 	if u.Scheme == "https" {
 		return nil
@@ -518,12 +581,44 @@ func validateRedirectURI(uri string) error {
 	return fmt.Errorf("redirect_uri must use https (or http://localhost for development)")
 }
 
-// clientIP extracts the client IP for rate limiting.
-// Uses RemoteAddr by default. When behind a trusted reverse proxy,
-// falls back to the first X-Forwarded-For entry (client-supplied IP).
-// For untrusted networks, configure your proxy to overwrite X-Forwarded-For.
-func clientIP(r *http.Request) string {
-	return r.RemoteAddr
+// clientIP extracts the client IP for rate limiting. Strips the port
+// from RemoteAddr so repeated connections from the same IP aggregate
+// under one rate-limit key. When the request arrived from a CIDR in
+// TrustedProxyCIDRs, the left-most public-looking X-Forwarded-For entry
+// is used instead.
+func (h *OAuthHandler) clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+
+	if len(h.trustedNets) > 0 {
+		remoteIP := net.ParseIP(host)
+		if remoteIP != nil && h.isTrustedProxy(remoteIP) {
+			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+				// Use the left-most entry — the original client.
+				for _, p := range strings.Split(xff, ",") {
+					candidate := strings.TrimSpace(p)
+					if candidate != "" {
+						return candidate
+					}
+				}
+			}
+			if xr := strings.TrimSpace(r.Header.Get("X-Real-IP")); xr != "" {
+				return xr
+			}
+		}
+	}
+	return host
+}
+
+func (h *OAuthHandler) isTrustedProxy(ip net.IP) bool {
+	for _, n := range h.trustedNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func writeOAuthJSON(w http.ResponseWriter, status int, v any) {

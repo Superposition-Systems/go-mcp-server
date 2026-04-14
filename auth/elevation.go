@@ -10,6 +10,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -26,23 +28,56 @@ import (
 // SHA-256 of a bearer token (see TokenHash).
 // -----------------------------------------------------------------------------
 
+// defaultMaxGrants is the ceiling for concurrent elevated sessions. At
+// SHA-256-per-token costs it bounds memory at roughly a few megabytes.
+const defaultMaxGrants = 10_000
+
+// ErrGrantStoreFull is returned by Grant when the active-grant cap has
+// been hit. Consistent with the defensive caps used elsewhere in the
+// codebase (auth-request store, token tables).
+var ErrGrantStoreFull = errors.New("grant store at capacity")
+
 // GrantStore holds time-bounded "this key is currently elevated" grants.
 type GrantStore struct {
-	mu     sync.Mutex
-	grants map[string]time.Time
+	mu        sync.Mutex
+	grants    map[string]time.Time
+	maxGrants int
 }
 
-// NewGrantStore returns an empty in-memory grant store.
+// NewGrantStore returns an empty in-memory grant store with the default
+// cap on concurrent active grants.
 func NewGrantStore() *GrantStore {
-	return &GrantStore{grants: make(map[string]time.Time)}
+	return &GrantStore{grants: make(map[string]time.Time), maxGrants: defaultMaxGrants}
+}
+
+// SetMaxGrants overrides the cap (primarily for tests).
+func (g *GrantStore) SetMaxGrants(n int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.maxGrants = n
 }
 
 // Grant marks key as elevated until now+ttl. A second Grant for the same
-// key refreshes the expiry.
-func (g *GrantStore) Grant(key string, ttl time.Duration) {
+// key refreshes the expiry. Returns ErrGrantStoreFull if the cap is hit
+// and the key is not already present (refreshing an existing grant is
+// always allowed).
+func (g *GrantStore) Grant(key string, ttl time.Duration) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if _, exists := g.grants[key]; !exists {
+		// Prune expired entries opportunistically before enforcing cap.
+		now := time.Now()
+		for k, exp := range g.grants {
+			if now.After(exp) {
+				delete(g.grants, k)
+			}
+		}
+		if g.maxGrants > 0 && len(g.grants) >= g.maxGrants {
+			return ErrGrantStoreFull
+		}
+	}
 	g.grants[key] = time.Now().Add(ttl)
+	return nil
 }
 
 // Has returns true if the key has an unexpired grant. Expired grants are
@@ -108,9 +143,10 @@ func (g *GrantStore) ActiveCount() int {
 // PasswordStore: on-disk hashed elevation password with bootstrap semantics.
 //
 // Bootstrap rule: if no password is stored and no env-var override is set,
-// IsSet() returns false and callers should treat the session as elevated by
-// default. The first SetInitial call establishes a password and closes the
-// bootstrap window.
+// IsSet() returns false and the server runs with a one-time bootstrap
+// token. The operator passes that token to set_elevation_password to
+// establish a password and close the bootstrap window. Clients that do
+// not know the token cannot call set_elevation_password.
 //
 // Hashing: PBKDF2-SHA256 with 600k iterations (matches modern browser
 // defaults for password storage). Uses stdlib crypto/pbkdf2 (Go 1.24+).
@@ -134,22 +170,32 @@ var ErrIncorrectPassword = errors.New("incorrect elevation password")
 // ErrEmptyPassword is returned when a caller tries to set an empty password.
 var ErrEmptyPassword = errors.New("elevation password cannot be empty")
 
+// ErrInvalidBootstrapToken is returned when SetInitial is called without
+// the bootstrap token (or with a wrong value) while bootstrap mode is
+// active.
+var ErrInvalidBootstrapToken = errors.New("invalid or missing bootstrap token")
+
 // PasswordStore persists the elevation password hash (and set/rotation
 // timestamps) in SQLite. A non-empty envPassword overrides the stored
 // password for the lifetime of this process — useful for strict-mode
 // deployments that want to bypass the bootstrap window entirely.
 type PasswordStore struct {
-	db          *sql.DB
-	mu          sync.Mutex
-	envPassword string // if non-empty, used instead of stored hash
+	db             *sql.DB
+	mu             sync.Mutex
+	envPassword    string // if non-empty, used instead of stored hash
+	bootstrapToken string // one-time token for initial password setup (when applicable)
 }
 
 // NewPasswordStore opens (or creates) the SQLite database at dbPath and
 // prepares the elevation_password table. If envPassword is non-empty, it
-// takes precedence over any stored password for this process — IsSet will
-// return true, Verify will compare against envPassword, and SetInitial /
-// Rotate will return an error (rotation in strict-mode deployments is an
-// infrastructure operation, not a runtime one).
+// takes precedence over any stored password for this process.
+//
+// If the store opens in bootstrap mode (no password, no env override) a
+// random bootstrap token is generated. The caller is responsible for
+// surfacing it to the operator (typically via server logs) — it is
+// required by SetInitial to close the bootstrap window and guards
+// against a compromised OAuth client racing to seize the elevation
+// password.
 func NewPasswordStore(dbPath, envPassword string) (*PasswordStore, error) {
 	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -181,7 +227,18 @@ func NewPasswordStore(dbPath, envPassword string) (*PasswordStore, error) {
 		return nil, fmt.Errorf("create elevation_password table: %w", err)
 	}
 
-	return &PasswordStore{db: db, envPassword: envPassword}, nil
+	ps := &PasswordStore{db: db, envPassword: envPassword}
+
+	// Generate a bootstrap token if we are entering bootstrap mode.
+	if envPassword == "" {
+		var count int
+		_ = db.QueryRow("SELECT COUNT(*) FROM elevation_password").Scan(&count)
+		if count == 0 {
+			ps.bootstrapToken = RandomHex(24)
+		}
+	}
+
+	return ps, nil
 }
 
 // Close closes the underlying SQLite handle.
@@ -189,9 +246,18 @@ func (p *PasswordStore) Close() error {
 	return p.db.Close()
 }
 
+// BootstrapToken returns the one-time token required to close the
+// bootstrap window via SetInitial. Empty when bootstrap mode is not
+// active (a password is already set, or the env override is in use).
+func (p *PasswordStore) BootstrapToken() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.bootstrapToken
+}
+
 // IsSet returns true if a password is configured — either via the env
 // override or a previously-stored hash. When false, the server is in
-// bootstrap mode and callers should treat sessions as elevated by default.
+// bootstrap mode.
 func (p *PasswordStore) IsSet() bool {
 	if p.envPassword != "" {
 		return true
@@ -203,9 +269,11 @@ func (p *PasswordStore) IsSet() bool {
 	return count > 0
 }
 
-// SetInitial stores a password only if none has been set. Fails with
-// ErrPasswordAlreadySet if one already exists or the env override is in use.
-func (p *PasswordStore) SetInitial(newPassword string) error {
+// SetInitial stores a password only if none has been set AND the caller
+// presents the correct bootstrap token. Fails with ErrPasswordAlreadySet
+// if a password is already set, ErrInvalidBootstrapToken if the token is
+// wrong, and ErrEmptyPassword if newPassword is empty.
+func (p *PasswordStore) SetInitial(bootstrapToken, newPassword string) error {
 	if newPassword == "" {
 		return ErrEmptyPassword
 	}
@@ -223,17 +291,27 @@ func (p *PasswordStore) SetInitial(newPassword string) error {
 		return ErrPasswordAlreadySet
 	}
 
+	// Bootstrap token must match the one generated at construction.
+	if p.bootstrapToken == "" || !SafeEqual(bootstrapToken, p.bootstrapToken) {
+		return ErrInvalidBootstrapToken
+	}
+
 	salt, hash, err := derivePassword(newPassword)
 	if err != nil {
 		return err
 	}
 	now := time.Now().Unix()
-	_, err = p.db.Exec(
+	if _, err := p.db.Exec(
 		`INSERT INTO elevation_password (id, hash, salt, iterations, set_at, last_rotated_at)
 		 VALUES (1, ?, ?, ?, ?, ?)`,
 		hash, salt, pbkdf2Iterations, now, now,
-	)
-	return err
+	); err != nil {
+		return err
+	}
+	// Bootstrap is closed; the token is no longer useful and should be
+	// cleared so any lingering reference in logs cannot be replayed.
+	p.bootstrapToken = ""
+	return nil
 }
 
 // Rotate replaces the stored password. Requires the correct current
@@ -293,8 +371,8 @@ func (p *PasswordStore) Verify(password string) bool {
 
 // ElevationStatus is the timestamp snapshot returned by Status.
 type ElevationStatus struct {
-	PasswordSetAt time.Time
-	LastRotatedAt time.Time
+	PasswordSetAt  time.Time
+	LastRotatedAt  time.Time
 	ViaEnvOverride bool
 }
 
@@ -379,9 +457,10 @@ func HashToHex(b []byte) string {
 // before ListenAndServe — Status() and HasCurrentSession() return
 // sensible zero values until the stores are opened.
 type Elevation struct {
-	password *PasswordStore
-	grants   *GrantStore
-	ttl      time.Duration
+	password       *PasswordStore
+	grants         *GrantStore
+	ttl            time.Duration
+	attemptLimiter *RateLimiter // per-token-hash brute-force guard on Elevate
 }
 
 // NewElevation composes the two stores. The password store may be nil to
@@ -393,7 +472,12 @@ func NewElevation(password *PasswordStore, grants *GrantStore, ttl time.Duration
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
-	return &Elevation{password: password, grants: grants, ttl: ttl}
+	return &Elevation{
+		password:       password,
+		grants:         grants,
+		ttl:            ttl,
+		attemptLimiter: NewRateLimiter(5, 900), // 5 bad passwords per 15 minutes per session
+	}
 }
 
 // PasswordStore returns the underlying password store (may be nil if not
@@ -434,10 +518,15 @@ func (e *Elevation) HasCurrentSession(ctx context.Context) bool {
 	return e.grants.Has(hash)
 }
 
+// ErrElevationRateLimited is returned by Elevate when the caller has
+// exceeded the attempt limit on this session.
+var ErrElevationRateLimited = errors.New("too many elevation attempts; try again later")
+
 // Elevate verifies the password and, on success, grants elevation to the
 // token hash from ctx for the configured TTL. Returns the expiry on
-// success, ErrIncorrectPassword on wrong password, and a descriptive
-// error in bootstrap mode (where Elevate is a no-op — already elevated).
+// success, ErrIncorrectPassword on wrong password, ErrElevationRateLimited
+// when the attempt limit is exceeded, and a descriptive error in
+// bootstrap mode (where Elevate is a no-op — already elevated).
 func (e *Elevation) Elevate(ctx context.Context, password string) (time.Time, error) {
 	if e == nil || e.password == nil {
 		return time.Time{}, errors.New("elevation not initialized")
@@ -446,16 +535,63 @@ func (e *Elevation) Elevate(ctx context.Context, password string) (time.Time, er
 		// Already elevated by bootstrap rule; no grant needed.
 		return time.Time{}, errBootstrapAlreadyElevated
 	}
-	if !e.password.Verify(password) {
-		return time.Time{}, ErrIncorrectPassword
-	}
 	hash := GetTokenHash(ctx)
 	if hash == "" {
 		return time.Time{}, errors.New("no session identity on context")
 	}
-	e.grants.Grant(hash, e.ttl)
+	if e.attemptLimiter != nil && e.attemptLimiter.IsRateLimited(hash) {
+		return time.Time{}, ErrElevationRateLimited
+	}
+	if !e.password.Verify(password) {
+		if e.attemptLimiter != nil {
+			e.attemptLimiter.RecordFailure(hash)
+		}
+		return time.Time{}, ErrIncorrectPassword
+	}
+	if e.attemptLimiter != nil {
+		e.attemptLimiter.Clear(hash)
+	}
+	if err := e.grants.Grant(hash, e.ttl); err != nil {
+		return time.Time{}, err
+	}
 	exp, _ := e.grants.ExpiresAt(hash)
 	return exp, nil
+}
+
+// Middleware returns an http.Handler wrapper that stamps each request's
+// context with the result of HasCurrentSession, so downstream handlers
+// can call IsElevated(ctx) as the canonical check. This must be wired
+// AFTER BearerMiddleware (which puts the token hash on the context).
+func (e *Elevation) Middleware() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if e == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+			ctx := WithElevated(r.Context(), e.HasCurrentSession(r.Context()))
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// LogBootstrapBanner emits a highly-visible log message announcing the
+// bootstrap token if bootstrap mode is active. Called by the server at
+// startup. No-op when not in bootstrap mode.
+func (e *Elevation) LogBootstrapBanner() {
+	if e == nil || e.password == nil {
+		return
+	}
+	token := e.password.BootstrapToken()
+	if token == "" {
+		return
+	}
+	log.Printf("mcpserver: ======================================================================")
+	log.Printf("mcpserver: ELEVATION BOOTSTRAP — no password set")
+	log.Printf("mcpserver: Pass bootstrap_token=%q to set_elevation_password to", token)
+	log.Printf("mcpserver: establish the initial elevation password. This token is single-use")
+	log.Printf("mcpserver: and is regenerated on every restart while bootstrap mode is active.")
+	log.Printf("mcpserver: ======================================================================")
 }
 
 // errBootstrapAlreadyElevated is a sentinel used by Elevate; callers can

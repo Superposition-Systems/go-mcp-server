@@ -71,6 +71,46 @@ func (rl *RateLimiter) prune(ip string) {
 	}
 }
 
+// parseBearer extracts the token from an RFC 6750-compliant Authorization
+// header. The scheme match is case-insensitive; the token must be
+// non-empty after the single mandatory SP. Returns "" if the header is
+// not a usable Bearer credential.
+func parseBearer(header string) string {
+	if len(header) < 7 {
+		return ""
+	}
+	if !strings.EqualFold(header[:6], "Bearer") || header[6] != ' ' {
+		return ""
+	}
+	return strings.TrimSpace(header[7:])
+}
+
+// writeUnauthorized emits an RFC 6750 §3-compliant 401 with the
+// WWW-Authenticate challenge header that OAuth client libraries rely on
+// to trigger re-authorization flows.
+func writeUnauthorized(w http.ResponseWriter, description string) {
+	challenge := `Bearer realm="mcp"`
+	if description != "" {
+		challenge += `, error="invalid_token", error_description="` + sanitizeChallenge(description) + `"`
+	}
+	w.Header().Set("WWW-Authenticate", challenge)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	// Keep the response body minimal; clients act on the header.
+	_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+}
+
+// sanitizeChallenge strips characters that would break the quoted
+// challenge description (the WWW-Authenticate grammar is unforgiving).
+func sanitizeChallenge(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '"' || r == '\\' || r < 0x20 {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // BearerMiddleware creates HTTP middleware that requires a valid Bearer token
 // on specified paths. It supports dual-mode auth: a static bearer token
 // (for CLI tools like Claude Code) and OAuth access tokens (for claude.ai).
@@ -103,13 +143,11 @@ func BearerMiddleware(bearerToken string, tokenValidator func(string) bool, stor
 				return
 			}
 
-			authHeader := r.Header.Get("Authorization")
-			if !strings.HasPrefix(authHeader, "Bearer ") {
-				http.Error(w, `{"error":"Missing or invalid Authorization header"}`, http.StatusUnauthorized)
+			token := parseBearer(r.Header.Get("Authorization"))
+			if token == "" {
+				writeUnauthorized(w, "missing or malformed bearer token")
 				return
 			}
-
-			token := authHeader[7:]
 
 			// On any successful auth path, stash a hash of the token on the
 			// context so downstream handlers can identify this session without
@@ -137,7 +175,56 @@ func BearerMiddleware(bearerToken string, tokenValidator func(string) bool, stor
 				return
 			}
 
-			http.Error(w, `{"error":"Invalid token"}`, http.StatusUnauthorized)
+			writeUnauthorized(w, "invalid or expired bearer token")
+		})
+	}
+}
+
+// OriginAllowlistMiddleware rejects browser-initiated requests whose
+// Origin is not on the provided allowlist. When allowedOrigins is empty
+// the middleware is a pass-through — callers explicitly opt in to CORS
+// enforcement, since MCP servers are often fronted by reverse proxies
+// that already handle it.
+//
+// The check protects SSE endpoints against DNS-rebinding attacks: a
+// malicious page that has caused a victim's browser to resolve the
+// attacker's domain to 127.0.0.1 will still send the attacker's Origin
+// header, which will not match the allowlist.
+//
+// For preflight (OPTIONS) requests with a permitted Origin, the
+// middleware responds directly with the standard allow headers.
+func OriginAllowlistMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
+	allow := make(map[string]struct{}, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		allow[o] = struct{}{}
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if len(allow) == 0 {
+				next.ServeHTTP(w, r)
+				return
+			}
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				// Non-browser clients (curl, SDKs) omit Origin entirely.
+				// No CSRF risk without a browser to drive the attack.
+				next.ServeHTTP(w, r)
+				return
+			}
+			if _, ok := allow[origin]; !ok {
+				http.Error(w, `{"error":"origin not allowed"}`, http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			if r.Method == http.MethodOptions {
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept")
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			next.ServeHTTP(w, r)
 		})
 	}
 }

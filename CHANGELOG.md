@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.7.0] — 2026-04-14
+
+Security hardening round following a multi-agent audit of the OAuth flow,
+transport, elevation, and storage layers. Addresses 5 critical, 6 high,
+7 medium, and several lower-severity findings.
+
+### Added
+- **Bootstrap token for elevation**: when no elevation password is set, `NewPasswordStore` generates a random one-time token logged at startup. `set_elevation_password` now requires this token alongside `new_password` in bootstrap mode, preventing a compromised OAuth client from racing to seize the elevation feature. (Fixes C2.)
+- **`Elevation.Middleware()`**: HTTP middleware that stamps `auth.IsElevated(ctx)` with the current grant state. Automatically wired in `ListenAndServe` when `WithElevation` is set, so `auth.IsElevated` is now the authoritative check instead of a dead flag. (Fixes C1.)
+- **Per-session rate limit on `Elevate`**: 5 wrong-password attempts / 15 min per token hash, returning `ErrElevationRateLimited`. Blocks brute-force over the authenticated MCP channel. (Fixes H6.)
+- **Grant store cap**: default 10,000 active grants, consistent with other stores in the codebase. Configurable via `GrantStore.SetMaxGrants`. (Fixes M6.)
+- **`WithAllowedOrigins`**: optional browser Origin allowlist. When set, requests carrying a non-matching Origin are rejected with 403 and preflight is handled. Mitigates DNS-rebinding against local MCP servers. (Fixes H4.)
+- **`WithTrustedProxyCIDRs`**: enables `X-Forwarded-For` / `X-Real-IP` parsing only for proxies in the configured CIDR ranges. Without it, rate limiters correctly key on `RemoteAddr` (port-stripped). (Fixes H5.)
+- **`WithAllowMissingState`**: escape hatch for legacy OAuth clients that don't send `state`. Default is now strict (state required). (Related to C3.)
+- **`OAuthStore.VerifyClientSecret(id, secret)`**: constant-time comparison against the stored hash; `GetClient` no longer returns `ClientSecret`. (Fixes H2.)
+- **`AuthorizeLimiter`**: per-IP limiter on `GET /authorize` (60/hr default) to bound auth-request store flooding. (Fixes M3.)
+- **`auth.ScopeContains`**: RFC 6749 §3.3-correct space-delimited subset check, used by `VerifyAccessToken` and scope validation at authorize time. (Fixes M1.)
+- **`PasswordStore.BootstrapToken()`** and **`Elevation.LogBootstrapBanner()`** public helpers.
+- **`auth.OriginAllowlistMiddleware`** exposed for embedders.
+
+### Changed — BREAKING
+- **Token / code / client_secret storage is now hashed.** Access tokens, refresh tokens, authorization codes, and client secrets are stored as SHA-256 digests; lookups hash the presented value before comparison. A database file no longer discloses live credentials. (Fixes C4.)
+- **`OAuthStore.ConsumeRefreshToken(token, expectedClientID string)`** — client binding is checked BEFORE deletion. A wrong-client request now returns an error without consuming the legitimate client's token. (Fixes M2.)
+- **`PasswordStore.SetInitial(bootstrapToken, newPassword string)`** — requires the one-time token in bootstrap mode.
+- **`GrantStore.Grant(key, ttl) error`** — returns `ErrGrantStoreFull` when the cap is hit (for a new key; refreshing an existing grant remains always allowed).
+- **`ClientData.ClientSecret`** is populated only by `RegisterClient` (once, at issuance). `GetClient` returns an empty secret.
+- **State is required at `/authorize`** unless `WithAllowMissingState()` is set. PKCE alone does not fully substitute for CSRF state. (Fixes C3.)
+- **Scope at token exchange is no longer widened.** An empty requested scope now yields an empty granted scope rather than silently inheriting the server-configured scope. (Fixes H1.)
+- **`redirect_uri` registration rejects query strings and fragments** (RFC 6749 §3.1.2). (Fixes H3.)
+- **`VerifyAccessToken` and scope validation at `/authorize`** use set-based subset matching rather than string equality. Multi-scope tokens now work correctly. (Fixes M1.)
+
+### Fixed
+- **PKCE method normalization**: absent/empty `code_challenge_method` is normalized to `"S256"` at authorize time. The token exchange rejects anything other than `"S256"`. (Fixes C5.)
+- **`pkceVerify`**: uses direct `crypto/subtle.ConstantTimeCompare` on base64-encoded digests instead of double-hashing via `SafeEqual`. (Fixes L1.)
+- **Bearer scheme parsing**: case-insensitive per RFC 6750 §2.1; explicitly rejects empty tokens; trims whitespace. (Fixes L2.)
+- **`WWW-Authenticate` header** on all 401 responses from `BearerMiddleware`, as required by RFC 6750 §3. OAuth clients now correctly trigger re-authorization on token expiry. (Fixes M4.)
+- **`clientIP` port stripping**: `RemoteAddr`'s port suffix no longer fragments per-IP rate limit buckets. (Fixes H5.)
+- **`GetAuthRequest` timestamp capture**: `time.Now()` is captured once before the transaction and used for expiry, closing a microsecond TOCTOU window. (Fixes L6.)
+- **PIN value zeroized** on the `Server` struct after the OAuth handler is constructed, so a log dump of the server value cannot disclose it. (Fixes L5.)
+
+### Security advisory
+Operators upgrading from ≤v0.6.0 should plan for:
+1. **OAuth database migration** — existing unhashed tokens/codes/secrets will no longer verify. Roll the OAuth SQLite file (clients will re-register; issued access/refresh tokens are invalidated).
+2. **Elevation bootstrap token** — on first start after upgrade, the bootstrap token is printed to stdout and is required to call `set_elevation_password`. If a password is already set, nothing changes.
+3. **OAuth clients that do not send `state`** will be rejected — set `WithAllowMissingState()` to preserve legacy behavior while migrating.
+
 ## [v0.6.0] — 2026-04-14
 
 ### Added

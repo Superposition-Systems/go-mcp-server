@@ -38,6 +38,7 @@ type Server struct {
 	oauthDBPath string
 	routeOnce   sync.Once
 	outerMiddleware func(http.Handler) http.Handler // applied outside bearer auth
+	allowedOrigins  []string                        // CORS allowlist (optional)
 
 	// Elevation (optional). Configured via WithElevation. The stores open
 	// lazily on first Elevation() call so apps can fetch the handle during
@@ -166,6 +167,9 @@ func (s *Server) ListenAndServe() error {
 	}()
 
 	oauthHandler := auth.NewOAuthHandler(oauthStore, s.oauthConfig)
+	// The OAuth handler holds its own copy of the PIN; clear it from
+	// the Server struct so panics/log dumps of the Server don't expose it.
+	s.oauthConfig.PIN = ""
 
 	// Health
 	healthHandler := s.healthFunc
@@ -188,19 +192,34 @@ func (s *Server) ListenAndServe() error {
 		s.mux.HandleFunc("POST /token", oauthHandler.Token)
 	})
 
-	// Wrap with middleware: context-based timeout + bearer auth
-	var handler http.Handler
-	handler = auth.BearerMiddleware(s.bearerToken, s.tokenValidator, oauthStore, s.oauthConfig.Scope, s.mcpPath)(
-		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
-			defer cancel()
-			s.mux.ServeHTTP(w, r.WithContext(ctx))
-		}),
-	)
+	// Wrap with middleware: context-based timeout + optional elevation
+	// stamping + bearer auth. The elevation middleware sits INSIDE the
+	// bearer check so GetTokenHash is populated when HasCurrentSession
+	// runs.
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
+		defer cancel()
+		s.mux.ServeHTTP(w, r.WithContext(ctx))
+	})
+
+	var afterAuth http.Handler = inner
+	if s.elevation != nil {
+		afterAuth = s.elevation.Middleware()(inner)
+	}
+
+	var handler http.Handler = auth.BearerMiddleware(
+		s.bearerToken, s.tokenValidator, oauthStore, s.oauthConfig.Scope, s.mcpPath,
+	)(afterAuth)
 
 	// Apply outer middleware (e.g. auth scope tagging) — runs before bearer auth
 	if s.outerMiddleware != nil {
 		handler = s.outerMiddleware(handler)
+	}
+
+	// Origin allowlist (CORS) — outermost. A pass-through when no
+	// origins were configured.
+	if len(s.allowedOrigins) > 0 {
+		handler = auth.OriginAllowlistMiddleware(s.allowedOrigins)(handler)
 	}
 
 	log.Printf("mcpserver: %s v%s listening on :%s", s.info.Name, s.info.Version, s.port)

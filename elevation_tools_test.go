@@ -107,9 +107,20 @@ func TestElevationTools_SetInitialClosesBootstrap(t *testing.T) {
 		t.Fatal("expected bootstrap elevation before set_initial")
 	}
 
+	// Missing bootstrap_token must be rejected — a compromised client
+	// should not be able to seize the elevation password.
 	result, isErr := et.Call(ctx, "vps_set_elevation_password", map[string]any{"new_password": "first"})
+	if !isErr {
+		t.Fatalf("set_initial without bootstrap_token must fail, got %+v", result)
+	}
+
+	token := et.elev.PasswordStore().BootstrapToken()
+	result, isErr = et.Call(ctx, "vps_set_elevation_password", map[string]any{
+		"new_password":    "first",
+		"bootstrap_token": token,
+	})
 	if isErr {
-		t.Fatalf("set_initial should succeed, got %+v", result)
+		t.Fatalf("set_initial with bootstrap_token should succeed, got %+v", result)
 	}
 	m := result.(map[string]any)
 	if m["status"] != "set" {
@@ -146,8 +157,12 @@ func TestElevationTools_RotationRequiresCurrent(t *testing.T) {
 	}
 	ctx := auth.WithTokenHash(context.Background(), auth.TokenHash("t"))
 
-	// Establish initial password.
-	_, _ = et.Call(ctx, "vps_set_elevation_password", map[string]any{"new_password": "first"})
+	// Establish initial password (requires bootstrap_token).
+	token := et.elev.PasswordStore().BootstrapToken()
+	_, _ = et.Call(ctx, "vps_set_elevation_password", map[string]any{
+		"new_password":    "first",
+		"bootstrap_token": token,
+	})
 
 	// Rotate without current_password -> error.
 	result, isErr := et.Call(ctx, "vps_set_elevation_password", map[string]any{"new_password": "second"})

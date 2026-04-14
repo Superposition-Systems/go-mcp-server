@@ -45,7 +45,8 @@ func (s *Server) Elevation() *auth.Elevation {
 			log.Printf("mcpserver: elevation password configured (env_override=%v, ttl=%s)",
 				envPwd != "", s.elevation.TTL())
 		} else {
-			log.Printf("mcpserver: elevation in bootstrap mode — no password set, all authenticated sessions are elevated until set_elevation_password is called")
+			log.Printf("mcpserver: elevation in bootstrap mode — no password set")
+			s.elevation.LogBootstrapBanner()
 		}
 	})
 	return s.elevation
@@ -85,10 +86,10 @@ func (s *Server) wrapToolsWithElevation(user ToolHandler) ToolHandler {
 	}
 	prefix := s.elevationToolPrefix()
 	return &elevationTools{
-		inner:    user,
-		elev:     s.Elevation(),
-		elevate:  prefix + "_elevate",
-		setPwd:   prefix + "_set_elevation_password",
+		inner:   user,
+		elev:    s.Elevation(),
+		elevate: prefix + "_elevate",
+		setPwd:  prefix + "_set_elevation_password",
 	}
 }
 
@@ -135,10 +136,11 @@ func (e *elevationTools) ListTools() []ToolDef {
 	if _, dup := userNames[e.setPwd]; !dup {
 		out = append(out, ToolDef{
 			Name: e.setPwd,
-			Description: "Set or rotate the elevation password. When no password exists " +
-				"(bootstrap mode), pass only 'new_password' to establish it. To rotate " +
-				"an existing password, pass both 'current_password' and 'new_password'. " +
-				"Rotation revokes all active elevations.",
+			Description: "Set or rotate the elevation password. In bootstrap mode (no " +
+				"password yet), pass 'bootstrap_token' (printed to server logs at startup) " +
+				"together with 'new_password'. To rotate an existing password, pass " +
+				"'current_password' and 'new_password'. Rotation revokes all active " +
+				"elevations.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -149,6 +151,10 @@ func (e *elevationTools) ListTools() []ToolDef {
 					"current_password": map[string]any{
 						"type":        "string",
 						"description": "Required when a password is already set (rotation)",
+					},
+					"bootstrap_token": map[string]any{
+						"type":        "string",
+						"description": "One-time token printed to server logs; required in bootstrap mode",
 					},
 				},
 				"required":             []string{"new_password"},
@@ -185,26 +191,31 @@ func (e *elevationTools) handleElevate(ctx context.Context, args map[string]any)
 	if err != nil {
 		if errors.Is(err, auth.ErrBootstrapAlreadyElevated) {
 			return map[string]any{
-				"elevated":      true,
-				"bootstrap":     true,
-				"note":          "No elevation password set — all authenticated sessions are elevated by default. Set a password with " + e.setPwd + " to enable gating.",
+				"elevated":  true,
+				"bootstrap": true,
+				"note": "No elevation password set — all authenticated sessions are elevated by default. " +
+					"Set a password with " + e.setPwd + " (passing bootstrap_token) to enable gating.",
 			}, false
 		}
 		if errors.Is(err, auth.ErrIncorrectPassword) {
 			return map[string]any{"error": "incorrect elevation password", "elevated": false}, true
 		}
+		if errors.Is(err, auth.ErrElevationRateLimited) {
+			return map[string]any{"error": err.Error(), "elevated": false}, true
+		}
 		return map[string]any{"error": err.Error(), "elevated": false}, true
 	}
 	return map[string]any{
-		"elevated":        true,
-		"elevated_until":  exp.UTC().Format(time.RFC3339),
-		"ttl_seconds":     int(e.elev.TTL().Seconds()),
+		"elevated":       true,
+		"elevated_until": exp.UTC().Format(time.RFC3339),
+		"ttl_seconds":    int(e.elev.TTL().Seconds()),
 	}, false
 }
 
 func (e *elevationTools) handleSetPassword(ctx context.Context, args map[string]any) (any, bool) {
 	newPwd, _ := args["new_password"].(string)
 	curPwd, _ := args["current_password"].(string)
+	bootstrapToken, _ := args["bootstrap_token"].(string)
 	if newPwd == "" {
 		return map[string]any{"error": "new_password is required"}, true
 	}
@@ -232,8 +243,14 @@ func (e *elevationTools) handleSetPassword(ctx context.Context, args map[string]
 		}, false
 	}
 
-	// Bootstrap path — no password yet.
-	if err := pwStore.SetInitial(newPwd); err != nil {
+	// Bootstrap path — no password yet. Require the one-time bootstrap
+	// token so a compromised OAuth client cannot race to seize control.
+	if err := pwStore.SetInitial(bootstrapToken, newPwd); err != nil {
+		if errors.Is(err, auth.ErrInvalidBootstrapToken) {
+			return map[string]any{
+				"error": "invalid or missing bootstrap_token (printed to server logs at startup)",
+			}, true
+		}
 		return map[string]any{"error": err.Error()}, true
 	}
 	return map[string]any{

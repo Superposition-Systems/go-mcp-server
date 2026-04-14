@@ -111,6 +111,35 @@ func WithConsent(title, description string) Option {
 	}
 }
 
+// WithAllowedOrigins enables browser-origin enforcement. When set, any
+// request carrying an Origin header that is not in the allowlist is
+// rejected with 403, and matching requests receive standard CORS headers.
+// Non-browser clients (which omit Origin) pass through unchanged.
+//
+// Recommended for public deployments where the MCP endpoint is reachable
+// from a browser and DNS-rebinding against a local MCP server is a risk.
+func WithAllowedOrigins(origins ...string) Option {
+	return func(s *Server) { s.allowedOrigins = append(s.allowedOrigins, origins...) }
+}
+
+// WithTrustedProxyCIDRs configures the OAuth handler to trust
+// X-Forwarded-For (or X-Real-IP) from requests arriving via the given
+// CIDR ranges. Without this, rate limiters key on the reverse-proxy IP,
+// which makes per-attacker bucketing impossible. Configure your proxy
+// to set X-Forwarded-For with the original client IP.
+func WithTrustedProxyCIDRs(cidrs ...string) Option {
+	return func(s *Server) {
+		s.oauthConfig.TrustedProxyCIDRs = append(s.oauthConfig.TrustedProxyCIDRs, cidrs...)
+	}
+}
+
+// WithAllowMissingState relaxes OAuth 2.1 state enforcement to
+// accommodate legacy clients. Not recommended for new deployments —
+// PKCE alone does not fully substitute for state on the redirect leg.
+func WithAllowMissingState() Option {
+	return func(s *Server) { s.oauthConfig.AllowMissingState = true }
+}
+
 // WithMiddleware sets an outer middleware that wraps the entire handler chain
 // (including bearer auth). This runs before any auth check, so it can inspect
 // the raw Authorization header to tag the request context with application-

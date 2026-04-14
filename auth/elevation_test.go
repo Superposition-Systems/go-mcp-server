@@ -89,12 +89,29 @@ func TestPasswordStore_BootstrapUnset(t *testing.T) {
 	if ps.Verify("anything") {
 		t.Fatal("Verify should fail with no password set")
 	}
+	if ps.BootstrapToken() == "" {
+		t.Fatal("bootstrap token should be generated in bootstrap mode")
+	}
+}
+
+func TestPasswordStore_SetInitialRejectsWrongToken(t *testing.T) {
+	ps := newTempPasswordStore(t, "")
+	if err := ps.SetInitial("wrong-token", "new-password"); !errors.Is(err, ErrInvalidBootstrapToken) {
+		t.Fatalf("expected ErrInvalidBootstrapToken, got %v", err)
+	}
+	if ps.IsSet() {
+		t.Fatal("failed SetInitial must not leave a password behind")
+	}
 }
 
 func TestPasswordStore_SetInitial(t *testing.T) {
 	ps := newTempPasswordStore(t, "")
-	if err := ps.SetInitial("correct-horse-battery-staple"); err != nil {
+	token := ps.BootstrapToken()
+	if err := ps.SetInitial(token, "correct-horse-battery-staple"); err != nil {
 		t.Fatalf("SetInitial: %v", err)
+	}
+	if ps.BootstrapToken() != "" {
+		t.Fatal("bootstrap token should be cleared after successful SetInitial")
 	}
 	if !ps.IsSet() {
 		t.Fatal("should be set after SetInitial")
@@ -116,24 +133,25 @@ func TestPasswordStore_SetInitial(t *testing.T) {
 
 func TestPasswordStore_SetInitialEmpty(t *testing.T) {
 	ps := newTempPasswordStore(t, "")
-	if err := ps.SetInitial(""); !errors.Is(err, ErrEmptyPassword) {
+	if err := ps.SetInitial(ps.BootstrapToken(), ""); !errors.Is(err, ErrEmptyPassword) {
 		t.Fatalf("expected ErrEmptyPassword, got %v", err)
 	}
 }
 
 func TestPasswordStore_SetInitialTwiceFails(t *testing.T) {
 	ps := newTempPasswordStore(t, "")
-	if err := ps.SetInitial("first"); err != nil {
+	token := ps.BootstrapToken()
+	if err := ps.SetInitial(token, "first"); err != nil {
 		t.Fatal(err)
 	}
-	if err := ps.SetInitial("second"); !errors.Is(err, ErrPasswordAlreadySet) {
+	if err := ps.SetInitial(token, "second"); !errors.Is(err, ErrPasswordAlreadySet) {
 		t.Fatalf("expected ErrPasswordAlreadySet, got %v", err)
 	}
 }
 
 func TestPasswordStore_Rotate(t *testing.T) {
 	ps := newTempPasswordStore(t, "")
-	if err := ps.SetInitial("old"); err != nil {
+	if err := ps.SetInitial(ps.BootstrapToken(), "old"); err != nil {
 		t.Fatal(err)
 	}
 	firstStatus := ps.Status()
@@ -182,7 +200,7 @@ func TestPasswordStore_EnvOverride(t *testing.T) {
 	if ps.Verify("other") {
 		t.Fatal("env override should reject mismatches")
 	}
-	if err := ps.SetInitial("anything"); !errors.Is(err, ErrPasswordAlreadySet) {
+	if err := ps.SetInitial("any-token", "anything"); !errors.Is(err, ErrPasswordAlreadySet) {
 		t.Fatalf("SetInitial under env override should fail with ErrPasswordAlreadySet, got %v", err)
 	}
 	if err := ps.Rotate("env-secret", "new"); !errors.Is(err, ErrPasswordAlreadySet) {
@@ -220,7 +238,7 @@ func TestElevation_BootstrapMode(t *testing.T) {
 
 func TestElevation_GrantLifecycle(t *testing.T) {
 	e := newElevation(t, "")
-	if err := e.PasswordStore().SetInitial("pw"); err != nil {
+	if err := e.PasswordStore().SetInitial(e.PasswordStore().BootstrapToken(), "pw"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -252,7 +270,7 @@ func TestElevation_GrantLifecycle(t *testing.T) {
 
 func TestElevation_RotationRevokesGrants(t *testing.T) {
 	e := newElevation(t, "")
-	if err := e.PasswordStore().SetInitial("pw"); err != nil {
+	if err := e.PasswordStore().SetInitial(e.PasswordStore().BootstrapToken(), "pw"); err != nil {
 		t.Fatal(err)
 	}
 	ctxA := ctxWithToken("token-A")
@@ -277,7 +295,7 @@ func TestElevation_RotationRevokesGrants(t *testing.T) {
 
 func TestElevation_GrantExpiry(t *testing.T) {
 	e := newElevation(t, "")
-	if err := e.PasswordStore().SetInitial("pw"); err != nil {
+	if err := e.PasswordStore().SetInitial(e.PasswordStore().BootstrapToken(), "pw"); err != nil {
 		t.Fatal(err)
 	}
 	ctxA := ctxWithToken("token-A")
