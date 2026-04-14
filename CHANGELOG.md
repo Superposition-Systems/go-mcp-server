@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.7.3] — 2026-04-14
+
+Fourth-pass audit. Small, focused round — no critical bugs, mostly
+hardening cleanup. Several headline "critical" agent findings turned
+out to be false positives (audit agents misreading intentional
+single-use credential deletion as "regression") and were rejected.
+
+### Fixed
+- **`clientIP` now canonicalizes trusted-proxy header values through `net.ParseIP`.** Previously an attacker behind a trusted proxy could send `X-Forwarded-For: anything_here` (any string) and the raw value became a rate-limit key, letting them spray unlimited distinct buckets and defeat per-IP limiting. XFF and X-Real-IP values are now parsed, port-stripped if present, and rejected if not a valid IP. Untrusted or unparseable entries fall back to `RemoteAddr`. (R1)
+- **`pkceVerify` adds an explicit length guard after the verifier hash.** Previously, `subtle.ConstantTimeCompare` was called with `computed` (always 43 bytes) vs `codeChallenge` (capped at 128 bytes); an unequal-length input would short-circuit instantly, violating the claimed constant-time property even if not exploitable. Verifier-side timing remains uniform because the hash runs unconditionally before the check. (R2)
+- **`verifyPassword` refuses to compare against a stored hash shorter than `pbkdf2KeyLen`.** Defense-in-depth against a corrupted or zero-length DB row: `pbkdf2.Key(..., 0)` returns `[]byte{}` and `subtle.ConstantTimeCompare([]byte{}, []byte{})` returns 1 (equal), which would accept any password. No current code path produces this state; the guard is preventative. (R3)
+- **`elevationTools.ListTools` now uses the precomputed `userNames` map** set by `wrapToolsWithElevation`, falling back to a local rebuild only when the struct is instantiated directly (tests). Prior code rebuilt the map on every `ListTools` call, contradicting the intent of the v0.7.1 precompute fix. (R4)
+- **`ErrBootstrapAlreadyElevated` is now a single exported sentinel.** Prior code had both an unexported `errBootstrapAlreadyElevated` and an exported `ErrBootstrapAlreadyElevated` pointing at the same value — a maintenance hazard where a reassignment could silently break `errors.Is`. (R6)
+- **`dummyClientSecretHash` is now generated at package-init via `RandomHex(32)`** instead of being the all-zeros constant. Prevents a hypothetical compiler from recognizing that SHA-256 output is never all-zero and folding the dummy compare to constant-false. (R7)
+
+### Tests
+- `TestRegLimiterReturns429AtHTTPLayer` and `TestAuthorizeLimiterReturns429AtHTTPLayer` exercise the rate-limit primitives through their HTTP handlers — previously only the `RateLimiter` struct itself was tested, not the wiring. (R5)
+- `TestClientIPRejectsInvalidXForwardedFor` covers the XFF validation path end-to-end: garbage falls back to RemoteAddr, `ip:port` gets canonicalized, multi-entry skips unparseable, untrusted proxy ignores XFF.
+
+### Rejected audit findings (for the record)
+- "ConsumeAuthCode / ConsumeRefreshToken delete expired credentials before checking expiry — regression of v0.4.0 fix." This is intentional: single-use credentials that reach this code path have been *presented*, and must be burned whether valid or expired to prevent replay. The v0.4.0 fix corrected a different bug (a delete-error was being swallowed).
+- "Client-registered `scope` with newline bypasses validation." Not reachable — the client's registered `scope` field is echoed on registration but never consulted at authorize time; only `h.config.Scope` gates subsequent issuance.
+
 ## [v0.7.2] — 2026-04-14
 
 Third-pass audit follow-up. No critical vulnerabilities; a mix of

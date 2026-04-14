@@ -559,14 +559,24 @@ func SafeEqual(a, b string) bool {
 // it to the stored challenge in constant time.
 //
 // codeVerifier is the raw PKCE verifier sent by the client; this
-// function hashes it to base64url(SHA-256) and compares the result
-// against codeChallenge (itself already a stored base64url SHA-256
-// digest). Direct subtle.ConstantTimeCompare on the two digest-encoded
-// strings is correct here — they are fixed-length after this function's
-// hash, so no length oracle exists.
+// function hashes it (unconditionally — no early return on short
+// verifier input) to base64url(SHA-256) and compares the result
+// against codeChallenge.
+//
+// The verifier-hash step runs before any length check on codeChallenge
+// so timing does not disclose "was the verifier correct length"
+// separately from "was it the right value." A legitimate S256
+// codeChallenge is always 43 bytes (base64url-no-pad of 32 hash bytes);
+// anything else is a protocol error and always fails.
 func pkceVerify(codeVerifier, codeChallenge string) bool {
 	h := sha256.Sum256([]byte(codeVerifier))
 	computed := base64.RawURLEncoding.EncodeToString(h[:])
+	if len(codeChallenge) != len(computed) {
+		// Explicit length guard after the hash work, so subtle's
+		// implicit length-mismatch short-circuit never observably
+		// runs. Equivalent security, clearer intent.
+		return false
+	}
 	return subtle.ConstantTimeCompare([]byte(computed), []byte(codeChallenge)) == 1
 }
 
@@ -644,8 +654,14 @@ func validateRedirectURI(uri string) error {
 // clientIP extracts the client IP for rate limiting. Strips the port
 // from RemoteAddr so repeated connections from the same IP aggregate
 // under one rate-limit key. When the request arrived from a CIDR in
-// TrustedProxyCIDRs, the left-most public-looking X-Forwarded-For entry
-// is used instead.
+// TrustedProxyCIDRs, the left-most parseable X-Forwarded-For (or
+// X-Real-IP) entry is used instead.
+//
+// Every proxy-header candidate is run through net.ParseIP and
+// canonicalized via IP.String() before use. Without this, an attacker
+// behind a trusted proxy could spray arbitrary string values via
+// X-Forwarded-For and create unlimited distinct rate-limit keys,
+// filling the 100k-IP cap and defeating per-IP limiting entirely.
 func (h *OAuthHandler) clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -655,21 +671,48 @@ func (h *OAuthHandler) clientIP(r *http.Request) string {
 	if len(h.trustedNets) > 0 {
 		remoteIP := net.ParseIP(host)
 		if remoteIP != nil && h.isTrustedProxy(remoteIP) {
-			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-				// Use the left-most entry — the original client.
-				for _, p := range strings.Split(xff, ",") {
-					candidate := strings.TrimSpace(p)
-					if candidate != "" {
-						return candidate
-					}
-				}
+			if ip := firstValidIP(r.Header.Get("X-Forwarded-For")); ip != "" {
+				return ip
 			}
-			if xr := strings.TrimSpace(r.Header.Get("X-Real-IP")); xr != "" {
-				return xr
+			if ip := parseIPHeader(r.Header.Get("X-Real-IP")); ip != "" {
+				return ip
 			}
 		}
 	}
 	return host
+}
+
+// firstValidIP returns the left-most comma-separated entry in xff that
+// parses as an IP address (canonicalized). Returns "" if none parse.
+func firstValidIP(xff string) string {
+	if xff == "" {
+		return ""
+	}
+	for _, p := range strings.Split(xff, ",") {
+		if ip := parseIPHeader(p); ip != "" {
+			return ip
+		}
+	}
+	return ""
+}
+
+// parseIPHeader parses a proxy-supplied IP header value, tolerating
+// surrounding whitespace and an optional appended port. Returns the
+// canonical string form ("" on failure).
+func parseIPHeader(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	// Accept "ip:port" forms as well as bare IPs.
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		s = host
+	}
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
 }
 
 func (h *OAuthHandler) isTrustedProxy(ip net.IP) bool {

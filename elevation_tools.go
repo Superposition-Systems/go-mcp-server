@@ -113,9 +113,18 @@ type elevationTools struct {
 
 func (e *elevationTools) ListTools() []ToolDef {
 	user := e.inner.ListTools()
-	userNames := make(map[string]struct{}, len(user))
-	for _, t := range user {
-		userNames[t.Name] = struct{}{}
+
+	// Use the precomputed e.userNames when it was populated by the
+	// wrapToolsWithElevation constructor (the production path). Tests
+	// that instantiate elevationTools directly can leave e.userNames
+	// nil; in that case we fall back to rebuilding here so the output
+	// of ListTools remains correct even without the constructor.
+	userNames := e.userNames
+	if userNames == nil {
+		userNames = make(map[string]struct{}, len(user))
+		for _, t := range user {
+			userNames[t.Name] = struct{}{}
+		}
 	}
 
 	out := make([]ToolDef, 0, len(user)+2)

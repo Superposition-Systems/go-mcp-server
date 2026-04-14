@@ -197,6 +197,86 @@ func TestStoreTokenLifecycle(t *testing.T) {
 	}
 }
 
+func TestRegLimiterReturns429AtHTTPLayer(t *testing.T) {
+	store := newOAuthTestStore(t)
+	h := NewOAuthHandler(store, OAuthConfig{Scope: "mcp:tools", ExternalURL: "https://x"})
+	// Exhaust the registration limit for one IP (10/hr default).
+	for i := 0; i < 11; i++ {
+		req := httptest.NewRequest("POST", "/register", nil)
+		req.RemoteAddr = "10.0.0.1:1234"
+		rec := httptest.NewRecorder()
+		h.Register(rec, req)
+		if i < 10 && rec.Code == http.StatusTooManyRequests {
+			t.Fatalf("request %d: unexpectedly rate-limited early (code %d)", i, rec.Code)
+		}
+	}
+	// The 11th attempt must be 429.
+	req := httptest.NewRequest("POST", "/register", nil)
+	req.RemoteAddr = "10.0.0.1:5678"
+	rec := httptest.NewRecorder()
+	h.Register(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("expected 429 after exhausting RegLimiter, got %d", rec.Code)
+	}
+}
+
+func TestAuthorizeLimiterReturns429AtHTTPLayer(t *testing.T) {
+	store := newOAuthTestStore(t)
+	h := NewOAuthHandler(store, OAuthConfig{Scope: "mcp:tools", ExternalURL: "https://x"})
+	// AuthorizeLimiter allows 60/hr per IP. Send 61 malformed requests
+	// from one IP; the limiter is incremented on every attempt, so the
+	// 61st must return 429.
+	for i := 0; i < 61; i++ {
+		req := httptest.NewRequest("GET", "/authorize", nil)
+		req.RemoteAddr = "10.0.0.2:1234"
+		rec := httptest.NewRecorder()
+		h.AuthorizeGET(rec, req)
+	}
+	req := httptest.NewRequest("GET", "/authorize", nil)
+	req.RemoteAddr = "10.0.0.2:5678"
+	rec := httptest.NewRecorder()
+	h.AuthorizeGET(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("expected 429 after exhausting AuthorizeLimiter, got %d", rec.Code)
+	}
+}
+
+func TestClientIPRejectsInvalidXForwardedFor(t *testing.T) {
+	store := newOAuthTestStore(t)
+	h := NewOAuthHandler(store, OAuthConfig{
+		Scope:             "mcp:tools",
+		ExternalURL:       "https://x",
+		TrustedProxyCIDRs: []string{"10.0.0.0/8"},
+	})
+
+	// Garbage XFF from a trusted proxy falls back to RemoteAddr.
+	req := httptest.NewRequest("GET", "/authorize", nil)
+	req.RemoteAddr = "10.0.0.1:1234"
+	req.Header.Set("X-Forwarded-For", "not-an-ip")
+	if got := h.clientIP(req); got != "10.0.0.1" {
+		t.Errorf("invalid XFF should fall back to RemoteAddr host, got %q", got)
+	}
+
+	// Valid XFF with port is canonicalized.
+	req.Header.Set("X-Forwarded-For", "203.0.113.7:9999")
+	if got := h.clientIP(req); got != "203.0.113.7" {
+		t.Errorf("IP:port XFF should yield bare IP, got %q", got)
+	}
+
+	// Left-most of a multi-entry XFF wins (if parseable).
+	req.Header.Set("X-Forwarded-For", "garbage, 203.0.113.8")
+	if got := h.clientIP(req); got != "203.0.113.8" {
+		t.Errorf("multi-entry XFF should skip unparseable entries, got %q", got)
+	}
+
+	// Untrusted proxy: XFF is ignored entirely.
+	req.RemoteAddr = "198.51.100.1:1234"
+	req.Header.Set("X-Forwarded-For", "203.0.113.7")
+	if got := h.clientIP(req); got != "198.51.100.1" {
+		t.Errorf("untrusted proxy should ignore XFF, got %q", got)
+	}
+}
+
 func TestDiscoveryRefusesWithoutExternalURLForNonLocalhost(t *testing.T) {
 	store := newOAuthTestStore(t)
 	h := NewOAuthHandler(store, OAuthConfig{Scope: "mcp:tools"})

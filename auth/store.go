@@ -267,12 +267,13 @@ func (s *OAuthStore) GetClient(clientID string) (*ClientData, error) {
 	return &c, nil
 }
 
-// dummyClientSecretHash is a fixed 64-character hex string used as the
-// comparand on the unknown-client branch of VerifyClientSecret. Using a
-// distinct, real-looking dummy (rather than comparing a value to itself)
-// prevents a clever compiler or CPU short-path from recognizing the
-// self-compare as trivially true and skipping the expected work.
-const dummyClientSecretHash = "0000000000000000000000000000000000000000000000000000000000000000"
+// dummyClientSecretHash is a 64-character hex string generated fresh
+// at package-init time, used as the comparand on the unknown-client
+// branch of VerifyClientSecret. A distinct, random, real-looking dummy
+// (rather than a self-compare or a recognizable constant like all
+// zeros) prevents any compiler or CPU short-path from folding the
+// compare to a constant result.
+var dummyClientSecretHash = RandomHex(32)
 
 // VerifyClientSecret returns true if the presented secret matches the
 // hash stored for clientID.

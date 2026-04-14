@@ -444,6 +444,15 @@ func verifyPassword(password string, salt, expected []byte, iter int) bool {
 	if iter <= 0 {
 		iter = pbkdf2Iterations
 	}
+	// Defense-in-depth: a zero-length or short `expected` should never
+	// reach here (derivePassword always emits pbkdf2KeyLen bytes), but
+	// if a DB row is ever corrupted or tampered to contain an empty
+	// hash, pbkdf2.Key(..., 0) returns an empty slice and
+	// subtle.ConstantTimeCompare([]byte{}, []byte{}) returns 1 — any
+	// password would be accepted. Refuse.
+	if len(expected) < pbkdf2KeyLen {
+		return false
+	}
 	got, err := pbkdf2.Key(sha256.New, password, salt, iter, len(expected))
 	if err != nil {
 		return false
@@ -554,7 +563,7 @@ func (e *Elevation) Elevate(ctx context.Context, password string) (time.Time, er
 	}
 	if !e.password.IsSet() {
 		// Already elevated by bootstrap rule; no grant needed.
-		return time.Time{}, errBootstrapAlreadyElevated
+		return time.Time{}, ErrBootstrapAlreadyElevated
 	}
 	hash := GetTokenHash(ctx)
 	if hash == "" {
@@ -625,10 +634,7 @@ func (e *Elevation) LogBootstrapBanner() {
 	log.Printf("mcpserver: ======================================================================")
 }
 
-// errBootstrapAlreadyElevated is a sentinel used by Elevate; callers can
+// ErrBootstrapAlreadyElevated is the sentinel returned by Elevate when
+// the server is in bootstrap mode (no password configured). Callers can
 // check it with errors.Is to give a friendly "no password set" response.
-var errBootstrapAlreadyElevated = errors.New("bootstrap mode: elevation granted by default")
-
-// ErrBootstrapAlreadyElevated is the public sentinel for the Elevate-in-
-// bootstrap-mode case.
-var ErrBootstrapAlreadyElevated = errBootstrapAlreadyElevated
+var ErrBootstrapAlreadyElevated = errors.New("bootstrap mode: elevation granted by default")
