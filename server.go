@@ -24,20 +24,20 @@ import (
 //  3. Call Server.RegisterTools() to add the MCP layer
 //  4. Call Server.ListenAndServe() to start
 type Server struct {
-	mux         *http.ServeMux
-	info        ServerInfo
-	port        string
-	timeout     time.Duration
-	drainTime   time.Duration
-	oauthStore  *auth.OAuthStore
-	oauthConfig auth.OAuthConfig
-	bearerToken    string
-	tokenValidator func(string) bool
-	mcpPath     string
-	tools       ToolHandler
-	healthFunc  http.HandlerFunc
-	oauthDBPath string
-	routeOnce   sync.Once
+	mux             *http.ServeMux
+	info            ServerInfo
+	port            string
+	timeout         time.Duration
+	drainTime       time.Duration
+	oauthStore      *auth.OAuthStore
+	oauthConfig     auth.OAuthConfig
+	bearerToken     string
+	tokenValidator  func(string) bool
+	mcpPath         string
+	tools           ToolHandler
+	healthFunc      http.HandlerFunc
+	oauthDBPath     string
+	routeOnce       sync.Once
 	outerMiddleware func(http.Handler) http.Handler // applied outside bearer auth
 	allowedOrigins  []string                        // CORS allowlist (optional)
 
@@ -267,8 +267,35 @@ func (s *Server) ListenAndServe() error {
 
 	// Origin allowlist (CORS) — outermost. A pass-through when no
 	// origins were configured.
+	//
+	// Same-origin requests from the server to itself are always safe —
+	// the OAuth PIN consent form at /authorize is served from
+	// ExternalURL and POSTs back to the same endpoint, carrying
+	// Origin: <ExternalURL>. If the consumer didn't include their own
+	// URL in WithAllowedOrigins, the form submission gets a 403
+	// {"error":"origin not allowed"} and OAuth can never complete.
+	//
+	// Auto-inject ExternalURL's origin into the effective allowlist.
+	// A same-origin POST cannot be a DNS-rebinding attack: the browser
+	// can only be on that origin if the user trusts it. Leaves
+	// WithAllowedOrigins free to describe *third-party* browser callers
+	// (like https://claude.ai), which is the mental model consumers
+	// reach for first.
 	if len(s.allowedOrigins) > 0 {
-		handler = auth.OriginAllowlistMiddleware(s.allowedOrigins)(handler)
+		effective := s.allowedOrigins
+		if self := selfOriginFromExternalURL(s.oauthConfig.ExternalURL); self != "" {
+			seen := false
+			for _, o := range effective {
+				if o == self {
+					seen = true
+					break
+				}
+			}
+			if !seen {
+				effective = append(append([]string(nil), effective...), self)
+			}
+		}
+		handler = auth.OriginAllowlistMiddleware(effective)(handler)
 	}
 
 	log.Printf("mcpserver: %s v%s listening on :%s", s.info.Name, s.info.Version, s.port)
@@ -345,6 +372,28 @@ func (s *Server) ListenAndServe() error {
 		return fmt.Errorf("mcpserver: %w", serveErr)
 	}
 	return nil
+}
+
+// selfOriginFromExternalURL extracts the origin (scheme://host[:port])
+// from ExternalURL so it can be auto-included in the CORS allowlist.
+// Returns "" if externalURL is empty or unparseable — the caller treats
+// that as "no self-origin to inject." The server start-up validation
+// already rejects malformed ExternalURL values, so returning "" here
+// means the feature is simply not configured.
+//
+// Origin header format per RFC 6454: scheme "://" host [ ":" port ],
+// with no trailing slash and no path. url.URL's Host field already
+// includes the port when one is present in the source URL, which is
+// exactly what we need.
+func selfOriginFromExternalURL(externalURL string) string {
+	if externalURL == "" {
+		return ""
+	}
+	u, err := url.Parse(externalURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // RunHealthCheck performs an HTTP health check against localhost.

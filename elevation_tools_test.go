@@ -208,10 +208,10 @@ func TestElevationTools_RotationRequiresCurrent(t *testing.T) {
 
 func TestSanitizeToolPrefix(t *testing.T) {
 	cases := map[string]string{
-		"":             "mcp",
-		"vps-mcp":      "vps_mcp",
-		"My Server":    "my_server",
-		"NOTES":        "notes",
+		"":          "mcp",
+		"vps-mcp":   "vps_mcp",
+		"My Server": "my_server",
+		"NOTES":     "notes",
 	}
 	for in, want := range cases {
 		if got := sanitizeToolPrefix(in); got != want {

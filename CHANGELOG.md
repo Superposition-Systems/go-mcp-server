@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.7.5] — 2026-04-14
+
+Hotfix surfaced by the first real post-v0.7.4 deploy of vps-mcp:
+`WithAllowedOrigins` was rejecting the library's own PIN consent form
+submission with `403 {"error":"origin not allowed"}`, blocking every
+new OAuth authorization end-to-end.
+
+### Fixed
+- **`WithAllowedOrigins` now implicitly trusts the server's own
+  ExternalURL origin.** The PIN consent page at `/authorize` is served
+  from ExternalURL and POSTs back to the same endpoint; the browser
+  therefore carries `Origin: <ExternalURL>`. When the consumer passed
+  `WithAllowedOrigins("https://claude.ai")` (the expected third-party
+  browser caller) without also listing their own URL, the library
+  rejected the form's own submission. Server startup now extracts the
+  origin from ExternalURL and injects it into the effective allowlist
+  before handing it to `OriginAllowlistMiddleware`. A same-origin POST
+  cannot be a DNS-rebinding attack — the browser can only be on the
+  server's origin if the user already trusts it — so this is a safe
+  default, not a security relaxation. The public `WithAllowedOrigins`
+  semantics remain focused on *third-party* browser callers, which is
+  the mental model consumers reach for first.
+
+### Tests
+- `TestSelfOriginFromExternalURL` covers origin extraction: trailing
+  slash stripping, non-standard ports preserved, path/query discarded,
+  localhost dev shape accepted, malformed input returns empty.
+
+### Migration
+No API change. Consumers currently adding their own URL to
+`WithAllowedOrigins` (the vps-mcp workaround) can revert that line —
+the dedup check ensures it's a no-op either way.
+
 ## [v0.7.4] — 2026-04-14
 
 Fifth-pass audit, portfolio-wide scope. Treated this library as the

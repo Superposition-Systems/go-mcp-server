@@ -12,7 +12,7 @@ import (
 
 // mockToolHandler implements ToolHandler for testing.
 type mockToolHandler struct {
-	tools []ToolDef
+	tools  []ToolDef
 	callFn func(ctx context.Context, name string, args map[string]any) (any, bool)
 }
 

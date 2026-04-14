@@ -313,12 +313,12 @@ func TestDiscoveryRefusesWithoutExternalURLForNonLocalhost(t *testing.T) {
 func TestValidateRedirectURIRejectsDangerousForms(t *testing.T) {
 	// These should all fail.
 	bad := []string{
-		"https://example.com/?",             // bare trailing ?
-		"https://example.com/#frag",         // fragment
-		"https://u:p@example.com/callback",  // userinfo
-		"https://example.com/?foo=bar",      // query string
-		"ftp://example.com/callback",        // wrong scheme
-		"http://example.com/callback",       // http non-localhost
+		"https://example.com/?",            // bare trailing ?
+		"https://example.com/#frag",        // fragment
+		"https://u:p@example.com/callback", // userinfo
+		"https://example.com/?foo=bar",     // query string
+		"ftp://example.com/callback",       // wrong scheme
+		"http://example.com/callback",      // http non-localhost
 		"not-a-url",
 	}
 	for _, uri := range bad {
