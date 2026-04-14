@@ -142,6 +142,9 @@ All options are passed to `New()`:
 | `WithOAuthDBPath(path)` | `OAUTH_DB_PATH` env or `/data/oauth.db` | SQLite database path |
 | `WithAuth(cfg)` | — | Full `OAuthConfig` struct |
 | `WithMiddleware(mw)` | `nil` | Outer middleware (runs before auth) |
+| `WithAllowedOrigins(...)` | `nil` | Browser `Origin` allowlist; non-matching requests get 403. Mitigates DNS-rebinding on SSE endpoints. |
+| `WithTrustedProxyCIDRs(...)` | `nil` | CIDR ranges whose `X-Forwarded-For` / `X-Real-IP` the server may trust for rate-limiting keys. |
+| `WithAllowMissingState()` | `false` | Legacy opt-out — permits OAuth `/authorize` without the `state` parameter. Not recommended. |
 | `WithElevation(cfg)` | `nil` | Enables step-up-auth elevation (see [Elevation](#elevation)) |
 
 ### Environment Variables
@@ -227,7 +230,7 @@ The intended use case: distinguishing *read-only* sessions (e.g. a cloud connect
 
 ### Bootstrap mode
 
-When no password is configured (neither stored on disk nor supplied via the env var), the server runs in **bootstrap mode**: every authenticated session is treated as elevated by default. This is the one-time window in which an operator calls `set_elevation_password` to establish the secret and close bootstrap mode. Intended for first-install convenience; the window is only as wide as the time between deploy and first configuration call, and is already gated by the outer bearer-token layer.
+When no password is configured (neither stored on disk nor supplied via the env var), the server runs in **bootstrap mode**: every authenticated session is treated as elevated by default. The server generates a random one-time **bootstrap token** at startup and prints it to stdout in a prominent banner. Calling `set_elevation_password` in bootstrap mode requires this token — preventing a compromised OAuth client from racing to seize the elevation feature. Once the initial password is set, the token is cleared and bootstrap mode closes.
 
 If that tradeoff is unacceptable (e.g. production deploys where no free-access window should ever exist), configure `EnvPasswordVar` and set that environment variable at startup. The env value becomes the elevation password, bootstrap mode is disabled, and runtime rotation is refused (rotate by changing the env var and restarting).
 
@@ -251,8 +254,8 @@ The library prefixes these with the server name (hyphens → underscores) unless
 
 | Tool | Arguments | Behavior |
 |---|---|---|
-| `<prefix>_elevate` | `password` | Grants elevation to the current session for `GrantTTL`. No-op success in bootstrap mode. |
-| `<prefix>_set_elevation_password` | `new_password` + (when rotating) `current_password` | Establishes first password or rotates. Rotation revokes all active elevations. |
+| `<prefix>_elevate` | `password` | Grants elevation to the current session for `GrantTTL`. In bootstrap mode returns immediately with `elevated=true, bootstrap=true`. Rate-limited to 5 wrong-password attempts per 15 min per session. |
+| `<prefix>_set_elevation_password` | `new_password` + `bootstrap_token` (first time) or `current_password` (rotation) | Establishes the first password (bootstrap) or rotates an existing one. Rotation revokes all active elevations. The bootstrap token is printed to server logs at startup. |
 
 ### Composing with handler-level checks
 
