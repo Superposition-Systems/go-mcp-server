@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sync"
@@ -120,6 +121,35 @@ func (s *Server) ListenAndServe() error {
 		return fmt.Errorf("mcpserver: no ToolHandler registered — call RegisterTools() before ListenAndServe()")
 	}
 
+	// Refuse to start with a dangerously short OAuth PIN. Rate limit is
+	// 5 attempts per 15 minutes per IP; at six characters (≈60 bits if
+	// mixed-case alpha, ≈20 bits if numeric) a single-IP attacker needs
+	// years — acceptable. Below that, even single-IP brute force is
+	// feasible in days and distributed attacks in minutes.
+	//
+	// Empty PIN is allowed (static-bearer-only deployments) — the
+	// existing startup warning covers that case.
+	if s.oauthConfig.PIN != "" && len(s.oauthConfig.PIN) < 6 {
+		return fmt.Errorf("mcpserver: AUTH_PIN is shorter than 6 characters; refusing to start. Set a longer PIN or unset AUTH_PIN for static-bearer-only mode")
+	}
+
+	// Refuse to start with a non-https ExternalURL unless the host is
+	// loopback. The issuer claim in discovery metadata must match the
+	// scheme clients will see at runtime — advertising http:// while
+	// Traefik terminates TLS produces spec-violating metadata and can
+	// fool downstream audience validation that expects https://.
+	if s.oauthConfig.ExternalURL != "" {
+		u, err := url.Parse(s.oauthConfig.ExternalURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("mcpserver: ExternalURL %q is not a valid absolute URL", s.oauthConfig.ExternalURL)
+		}
+		host := u.Hostname()
+		isLoopback := host == "localhost" || host == "127.0.0.1" || host == "::1"
+		if u.Scheme != "https" && !(u.Scheme == "http" && isLoopback) {
+			return fmt.Errorf("mcpserver: ExternalURL must be https:// (or http://localhost for dev), got %q", s.oauthConfig.ExternalURL)
+		}
+	}
+
 	// Resolve ResourcePath from mcpPath if not explicitly set via WithAuth
 	if s.oauthConfig.ResourcePath == "" {
 		s.oauthConfig.ResourcePath = s.mcpPath
@@ -208,6 +238,7 @@ func (s *Server) ListenAndServe() error {
 		s.mux.HandleFunc("GET /authorize", oauthHandler.AuthorizeGET)
 		s.mux.HandleFunc("POST /authorize", oauthHandler.AuthorizePOST)
 		s.mux.HandleFunc("POST /token", oauthHandler.Token)
+		s.mux.HandleFunc("POST /revoke", oauthHandler.Revoke)
 	})
 
 	// Wrap with middleware: context-based timeout + optional elevation
@@ -259,6 +290,14 @@ func (s *Server) ListenAndServe() error {
 		log.Printf("mcpserver: OAuth consent. Static-bearer-only deployments may ignore")
 		log.Printf("mcpserver: this warning; deployments expecting to serve claude.ai or")
 		log.Printf("mcpserver: other OAuth clients will fail every PIN submission.")
+		log.Printf("mcpserver: =========================================================")
+	}
+	if pinConfigured && len(pinAtHandlerBuild) < 8 {
+		log.Printf("mcpserver: =========================================================")
+		log.Printf("mcpserver: WARNING: AUTH_PIN is %d characters. With the current 5-per-", len(pinAtHandlerBuild))
+		log.Printf("mcpserver: 15-minute rate limit per IP, short numeric PINs fall in")
+		log.Printf("mcpserver: days from a single IP and minutes under modest IP")
+		log.Printf("mcpserver: distribution. Consider 8+ chars with mixed case/digits.")
 		log.Printf("mcpserver: =========================================================")
 	}
 	if s.oauthConfig.ExternalURL == "" {

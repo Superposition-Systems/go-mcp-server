@@ -60,6 +60,35 @@ func TestRateLimiterWindowExpiry(t *testing.T) {
 	}
 }
 
+func TestRateLimiterFailsClosedAtSaturation(t *testing.T) {
+	// When the map is at maxIPs, a novel (untracked) IP must be
+	// treated as limited. Without this, an attacker with a large IP
+	// pool bypasses rate limiting entirely by cycling fresh IPs once
+	// the cap is hit.
+	rl := NewRateLimiter(5, 900)
+	rl.maxIPs = 3 // shrink for the test
+
+	// Saturate the tracker with 3 distinct IPs at 1 attempt each (well
+	// under the per-IP limit of 5).
+	rl.RecordFailure("1.1.1.1")
+	rl.RecordFailure("2.2.2.2")
+	rl.RecordFailure("3.3.3.3")
+
+	// Each tracked IP is still within its per-IP budget, so they pass.
+	for _, ip := range []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"} {
+		if rl.IsRateLimited(ip) {
+			t.Errorf("tracked IP %s within budget should not be limited", ip)
+		}
+	}
+
+	// A novel IP with the map at cap must be treated as limited,
+	// because RecordFailure no-ops at cap and we cannot silently let
+	// it bypass the limiter.
+	if !rl.IsRateLimited("9.9.9.9") {
+		t.Fatal("SECURITY: novel IP at saturation was not rate-limited — attacker can bypass the limiter by cycling fresh IPs")
+	}
+}
+
 func TestRateLimiterPruneAll(t *testing.T) {
 	rl := NewRateLimiter(5, 1) // 1-second window
 	rl.RecordFailure("a")

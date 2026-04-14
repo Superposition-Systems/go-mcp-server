@@ -72,7 +72,7 @@ func TestGenerateDockerfile(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		"golang:1.24-alpine",
+		"golang:1.25-alpine",
 		"CGO_ENABLED=0",
 		"-o my-server",
 		"distroless/static-debian12",

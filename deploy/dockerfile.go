@@ -43,7 +43,11 @@ func GenerateDockerfile(cfg DockerfileConfig) (string, error) {
 		return "", err
 	}
 	if cfg.GoVersion == "" {
-		cfg.GoVersion = "1.24"
+		// Must track the `go` directive in this module's go.mod. A
+		// default older than go.mod produces Dockerfiles that fail to
+		// build the library, which tempts operators to drop the pin
+		// entirely (`FROM golang:alpine`) and lose reproducibility.
+		cfg.GoVersion = "1.25"
 	}
 	if cfg.Port == "" {
 		cfg.Port = "8080"

@@ -110,6 +110,7 @@ func (h *OAuthHandler) Discovery(w http.ResponseWriter, r *http.Request) {
 		"issuer":                                base,
 		"authorization_endpoint":                base + "/authorize",
 		"token_endpoint":                        base + "/token",
+		"revocation_endpoint":                   base + "/revoke",
 		"registration_endpoint":                 base + "/register",
 		"response_types_supported":              []string{"code"},
 		"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
@@ -173,24 +174,47 @@ func (h *OAuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	writeOAuthJSON(w, http.StatusCreated, client)
 }
 
+// redirectHost extracts the host portion of a redirect_uri for display on
+// the consent page. Returns "" when the URI cannot be parsed.
+func redirectHost(rawURI string) string {
+	if rawURI == "" {
+		return ""
+	}
+	u, err := url.Parse(rawURI)
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}
+
+// renderPINErr writes an error-state consent page. Used for pre-client-lookup
+// failures where ClientName/RedirectHost are not known. HTTP status and body
+// are written together.
+func (h *OAuthHandler) renderPINErr(w http.ResponseWriter, status int, authCtx, msg string) {
+	w.Header().Set("Content-Type", "text/html")
+	w.WriteHeader(status)
+	fmt.Fprint(w, RenderPINPage(PINPageData{
+		Title:       h.config.ConsentTitle,
+		Description: h.config.ConsentDescription,
+		AuthContext: authCtx,
+		ErrorMsg:    msg,
+	}))
+}
+
 // AuthorizeGET renders the PIN consent page.
 func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 	// Rate-limit per-IP to bound the server-side auth-request store
 	// against unauthenticated flood DoS.
 	ip := h.clientIP(r)
 	if h.AuthorizeLimiter.IsRateLimited(ip) {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusTooManyRequests)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Too many authorization requests from your address."))
+		h.renderPINErr(w, http.StatusTooManyRequests, "", "Too many authorization requests from your address.")
 		return
 	}
 	h.AuthorizeLimiter.RecordFailure(ip)
 
 	q := r.URL.Query()
 	if q.Get("response_type") != "code" {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Invalid response_type."))
+		h.renderPINErr(w, http.StatusBadRequest, "", "Invalid response_type.")
 		return
 	}
 
@@ -201,15 +225,11 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 	// store.
 	codeChallenge := q.Get("code_challenge")
 	if codeChallenge == "" {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "code_challenge is required (PKCE S256)."))
+		h.renderPINErr(w, http.StatusBadRequest, "", "code_challenge is required (PKCE S256).")
 		return
 	}
 	if len(codeChallenge) > 128 {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "code_challenge too long."))
+		h.renderPINErr(w, http.StatusBadRequest, "", "code_challenge too long.")
 		return
 	}
 
@@ -222,9 +242,7 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 		ccm = "S256"
 	}
 	if ccm != "S256" {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Unsupported code_challenge_method. Only S256 is supported."))
+		h.renderPINErr(w, http.StatusBadRequest, "", "Unsupported code_challenge_method. Only S256 is supported.")
 		return
 	}
 
@@ -232,32 +250,24 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 	// plus state form defense-in-depth against CSRF on the redirect.
 	state := q.Get("state")
 	if state == "" && !h.config.AllowMissingState {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "state parameter is required."))
+		h.renderPINErr(w, http.StatusBadRequest, "", "state parameter is required.")
 		return
 	}
 	if len(state) > 512 {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "state parameter too long."))
+		h.renderPINErr(w, http.StatusBadRequest, "", "state parameter too long.")
 		return
 	}
 
 	client, err := h.Store.GetClient(q.Get("client_id"))
 	if err != nil || client == nil {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Unknown client_id."))
+		h.renderPINErr(w, http.StatusBadRequest, "", "Unknown client_id.")
 		return
 	}
 
 	// Validate redirect_uri against registered URIs before rendering consent (RFC 6749 §3.1.2.4)
 	reqRedirectURI := q.Get("redirect_uri")
 	if len(client.RedirectURIs) == 0 {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Client has no registered redirect URIs."))
+		h.renderPINErr(w, http.StatusBadRequest, "", "Client has no registered redirect URIs.")
 		return
 	}
 	uriFound := false
@@ -268,18 +278,14 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !uriFound {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Invalid redirect_uri."))
+		h.renderPINErr(w, http.StatusBadRequest, "", "Invalid redirect_uri.")
 		return
 	}
 
 	// Validate requested scope is a subset of the configured scope.
 	reqScope := q.Get("scope")
 	if reqScope != "" && !ScopeContains(h.config.Scope, reqScope) {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Invalid scope."))
+		h.renderPINErr(w, http.StatusBadRequest, "", "Invalid scope.")
 		return
 	}
 
@@ -293,55 +299,53 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 		"code_challenge_method": ccm,
 		"scope":                 reqScope,
 	}); err != nil {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Server error."))
+		h.renderPINErr(w, http.StatusInternalServerError, "", "Server error.")
 		return
 	}
 
+	// Happy path — render consent page with client identity so the
+	// operator can visually confirm who they are authorizing before
+	// entering the PIN. Redirect host is the validated registered
+	// value, not attacker-controlled input.
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, requestID, ""))
+	fmt.Fprint(w, RenderPINPage(PINPageData{
+		Title:        h.config.ConsentTitle,
+		Description:  h.config.ConsentDescription,
+		AuthContext:  requestID,
+		ClientName:   client.ClientName,
+		RedirectHost: redirectHost(reqRedirectURI),
+	}))
 }
 
 // AuthorizePOST validates the PIN and issues an authorization code.
 func (h *OAuthHandler) AuthorizePOST(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 64*1024) // 64 KB — generous for a PIN form
 	if err := r.ParseForm(); err != nil {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Invalid form data."))
+		h.renderPINErr(w, http.StatusBadRequest, "", "Invalid form data.")
 		return
 	}
 	pin := r.FormValue("pin")
 	requestID := r.FormValue("auth_context") // reuse field name for the opaque request ID
 
 	if requestID == "" {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Missing authorization context."))
+		h.renderPINErr(w, http.StatusBadRequest, "", "Missing authorization context.")
 		return
 	}
 
 	ip := h.clientIP(r)
 	if h.PINLimiter.IsRateLimited(ip) {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusTooManyRequests)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, requestID, "Too many attempts. Try later."))
+		h.renderPINErr(w, http.StatusTooManyRequests, requestID, "Too many attempts. Try later.")
 		return
 	}
 
 	if h.config.PIN == "" {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, requestID, "Server PIN not configured."))
+		h.renderPINErr(w, http.StatusInternalServerError, requestID, "Server PIN not configured.")
 		return
 	}
 
 	if !SafeEqual(pin, h.config.PIN) {
 		h.PINLimiter.RecordFailure(ip)
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusForbidden)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, requestID, "Incorrect PIN."))
+		h.renderPINErr(w, http.StatusForbidden, requestID, "Incorrect PIN.")
 		return
 	}
 	h.PINLimiter.Clear(ip)
@@ -349,25 +353,19 @@ func (h *OAuthHandler) AuthorizePOST(w http.ResponseWriter, r *http.Request) {
 	// Retrieve server-side stored auth request (tamper-proof)
 	authCtx, err := h.Store.GetAuthRequest(requestID)
 	if err != nil {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Authorization request expired or invalid."))
+		h.renderPINErr(w, http.StatusBadRequest, "", "Authorization request expired or invalid.")
 		return
 	}
 
 	client, err := h.Store.GetClient(authCtx["client_id"])
 	if err != nil || client == nil {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Unknown client_id"))
+		h.renderPINErr(w, http.StatusBadRequest, "", "Unknown client_id")
 		return
 	}
 
 	// Redirect URI validation — ALWAYS required, reject if client has no URIs
 	if len(client.RedirectURIs) == 0 {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Client has no registered redirect URIs."))
+		h.renderPINErr(w, http.StatusBadRequest, "", "Client has no registered redirect URIs.")
 		return
 	}
 	found := false
@@ -378,9 +376,7 @@ func (h *OAuthHandler) AuthorizePOST(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !found {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Invalid redirect_uri"))
+		h.renderPINErr(w, http.StatusBadRequest, "", "Invalid redirect_uri")
 		return
 	}
 
@@ -393,9 +389,7 @@ func (h *OAuthHandler) AuthorizePOST(w http.ResponseWriter, r *http.Request) {
 		Scope:               authCtx["scope"],
 		CreatedAt:           time.Now().Unix(),
 	}); err != nil {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "Failed to create authorization code."))
+		h.renderPINErr(w, http.StatusInternalServerError, "", "Failed to create authorization code.")
 		return
 	}
 
@@ -501,6 +495,50 @@ func (h *OAuthHandler) exchangeAuthCode(w http.ResponseWriter, r *http.Request) 
 		"refresh_token": refreshToken,
 		"scope":         scope,
 	})
+}
+
+// Revoke handles RFC 7009 token revocation. The client authenticates
+// with client_secret_post; on success, the token is removed from the
+// store. The response is 200 regardless of whether the token existed —
+// §2.2 of the RFC mandates this to prevent probing.
+//
+// Unauthenticated or wrong-client requests receive 401. Store errors
+// surface as 503 so operators know revocation did not take effect
+// (fail-loud rather than the RFC's usual fail-quiet semantic —
+// silently "succeeding" on a store failure would defeat the whole
+// purpose of revocation).
+func (h *OAuthHandler) Revoke(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	if err := r.ParseForm(); err != nil {
+		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request"})
+		return
+	}
+	clientID := r.FormValue("client_id")
+	clientSecret := r.FormValue("client_secret")
+	token := r.FormValue("token")
+
+	if !h.Store.VerifyClientSecret(clientID, clientSecret) {
+		writeOAuthJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid_client"})
+		return
+	}
+	// An empty token is a malformed request; callers should not hit
+	// this endpoint without one. Per the RFC we could also return 200,
+	// but silently accepting empty tokens would hide client bugs.
+	if token == "" {
+		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request", "error_description": "token required"})
+		return
+	}
+	// token_type_hint is optional and we ignore it — our two token
+	// spaces are disjoint hash digests so we can safely check both.
+
+	if err := h.Store.RevokeToken(token, clientID); err != nil {
+		log.Printf("mcpserver: token revocation failed: %v", err)
+		writeOAuthJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "server_error"})
+		return
+	}
+	// RFC 7009 §2.2: 200 with empty body on success (or on unknown
+	// token). We emit {} for clients that insist on JSON.
+	writeOAuthJSON(w, http.StatusOK, map[string]any{})
 }
 
 func (h *OAuthHandler) exchangeRefreshToken(w http.ResponseWriter, r *http.Request) {

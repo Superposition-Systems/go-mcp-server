@@ -27,11 +27,21 @@ func NewRateLimiter(maxAttempts int, windowSeconds int) *RateLimiter {
 	}
 }
 
-// IsRateLimited returns true if the IP has exceeded the limit.
+// IsRateLimited returns true if the IP has exceeded the limit, OR if
+// the tracking map is at its maxIPs cap and this IP is not already
+// being tracked. The cap branch is the important one: without it, an
+// attacker with > maxIPs distinct source addresses can fill the map
+// once and then spray unlimited attempts from fresh IPs (each one
+// unseen, each one returning "not limited") until the pruner runs.
+// Failing closed at saturation turns that DoS-on-the-limiter into a
+// loud, bounded, logged global lockout instead.
 func (rl *RateLimiter) IsRateLimited(ip string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	rl.prune(ip)
+	if _, tracked := rl.attempts[ip]; !tracked && len(rl.attempts) >= rl.maxIPs {
+		return true
+	}
 	return len(rl.attempts[ip]) >= rl.maxAttempts
 }
 

@@ -100,6 +100,7 @@ New(opts...) → Mux() → [mount REST routes] → RegisterTools() → ListenAnd
 | `/register` | POST | RFC 7591 dynamic client registration |
 | `/authorize` | GET/POST | OAuth PIN consent page |
 | `/token` | POST | Token exchange & refresh |
+| `/revoke` | POST | RFC 7009 token revocation (access + refresh) |
 
 ## ToolHandler Interface
 
@@ -215,6 +216,8 @@ Client                          Server                          User
 - Refresh tokens rotate on use (old token invalidated).
 - All secrets compared using constant-time operations (`SafeEqual`).
 - Auth request parameters stored server-side (not in browser forms).
+- The PIN consent page displays the registered `client_name` and the `redirect_uri` host so the operator can visually confirm *who* they are authorizing. Without this, a DCR-registered client with an attacker-controlled redirect URI would be visually indistinguishable from a legitimate one.
+- `POST /revoke` (RFC 7009) removes a presented access or refresh token from the store. Authenticates the client with `client_secret_post` and silently succeeds on unknown tokens (RFC-mandated, prevents probing). Store failures surface as `503` rather than a quiet `200` so operators know the revocation did not take effect.
 
 ### Bearer Middleware
 
@@ -317,7 +320,7 @@ All connections enforce timeouts to prevent slowloris and connection exhaustion:
 | `POST /register` (client registration) | 10 attempts per IP | 1 hour |
 | Elevation password attempts (per session) | 5 attempts per token hash | 15 minutes |
 
-PIN rate limits clear on successful authentication. Registration and authorize-GET rate limits count all attempts regardless of outcome. All limiters have a 100k-IP capacity cap and are periodically pruned (every 5 min) so idle entries do not stick and allow bypass.
+PIN rate limits clear on successful authentication. Registration and authorize-GET rate limits count all attempts regardless of outcome. All limiters have a 100k-IP capacity cap and are periodically pruned (every 5 min) so idle entries do not stick and allow bypass. At saturation (map at cap), limiters fail closed — novel IPs are rejected rather than silently untracked — so an attacker with a large IP pool cannot bypass rate limiting by cycling fresh addresses.
 
 When running behind a reverse proxy, use `WithTrustedProxyCIDRs(...)` so the limiters key on the real client IP rather than the proxy's IP — otherwise all clients share one bucket.
 
@@ -325,7 +328,13 @@ When running behind a reverse proxy, use `WithTrustedProxyCIDRs(...)` so the lim
 
 In production, set `WithExternalURL("https://your-domain.com")` (or the `EXTERNAL_URL` env var). This hardcodes the OAuth issuer URL in discovery metadata, preventing Host header injection attacks.
 
+The server refuses to start if `ExternalURL` is set to a non-`https://` URL unless the host is a loopback address (`localhost`, `127.0.0.1`, `::1`). This closes the common footgun of a typo'd or copy-pasted `http://` production URL producing spec-violating discovery metadata.
+
 Without it, OAuth discovery (`/.well-known/oauth-authorization-server` and `/.well-known/oauth-protected-resource`) will serve metadata only for `localhost`, `127.0.0.1`, or `::1` requests. Non-localhost requests receive `HTTP 500` with a clear error message instead of silently-poisoned "http://localhost" metadata. This makes misconfigured production deployments fail loudly rather than silently trusting attacker-controlled `Host` headers.
+
+### PIN Strength
+
+The server refuses to start if `AUTH_PIN` is shorter than 6 characters, and logs a warning for PINs shorter than 8 characters. With the 5-per-15-minute rate limit, a 4-digit numeric PIN is brute-forceable in days from a single IP; the floor closes that footgun without constraining legitimate deployments. An unset PIN is allowed (static-bearer-only mode).
 
 ### Redirect URI Validation
 
@@ -356,7 +365,7 @@ All database tables are bounded to prevent disk exhaustion from unauthenticated 
 
 - All secret comparisons are constant-time: `SafeEqual()` (SHA-256 + `crypto/subtle.ConstantTimeCompare`, length-hiding) for raw-secret compares, and direct `crypto/subtle.ConstantTimeCompare` on fixed-length digests where the inputs are already hashed (`VerifyClientSecret`, `pkceVerify`, `verifyPassword`).
 - Tokens generated with `crypto/rand` (32 bytes = 64 hex characters).
-- OAuth state stored in SQLite with WAL mode, foreign keys, and `SetMaxOpenConns(1)` for single-writer safety.
+- OAuth state stored in SQLite with WAL mode, foreign keys, and `SetMaxOpenConns(1)` for single-writer safety. The database directory is chmod'd to `0700` and the DB file to `0600` at startup so bind-mount / volume-copy scenarios do not leak metadata to other UIDs.
 - All consume operations (auth codes, refresh tokens, auth requests) use database transactions for atomicity.
 - Expired tokens and codes cleaned up every 5 minutes in a background goroutine.
 - Unknown JSON-RPC method names are truncated to 64 characters before inclusion in error messages.
@@ -412,7 +421,7 @@ Generates a two-stage Dockerfile using distroless base images (~12 MB final imag
 import "github.com/Superposition-Systems/go-mcp-server/deploy"
 
 content, err := deploy.GenerateDockerfile(deploy.DockerfileConfig{
-    GoVersion:  "1.24",
+    GoVersion:  "1.25",
     BinaryName: "my-mcp-server",
     Port:       "8080",
 })

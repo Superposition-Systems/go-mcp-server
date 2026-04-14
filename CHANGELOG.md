@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.7.4] — 2026-04-14
+
+Fifth-pass audit, portfolio-wide scope. Treated this library as the
+shared auth surface for every public-facing MCP server in the
+Superposition Systems portfolio (Atlassian, GitHub, Slack, VPS,
+Voxhub, Traxos, md2pdf, Claude Logs, Doc-Crawler, YouDoYoutube), so
+severity was weighted accordingly.
+
+One HIGH finding, three MEDIUM, two LOW applied. One LOW deferred
+(tool-handler `client_id` plumbing — adds unused API surface until a
+consumer actually needs per-tenant partitioning).
+
+### Breaking (for invalid configs)
+- **`ListenAndServe` now refuses to start** if `AUTH_PIN` is shorter than 6 characters. With the current 5-per-15-minute rate limit, a 4-digit numeric PIN falls in days from a single IP. Unset PIN is still allowed (static-bearer-only mode). PINs of 6–7 chars log a warning banner. (M-1)
+- **`ListenAndServe` now refuses to start** if `ExternalURL` is set to a non-`https://` URL, unless the host is `localhost`/`127.0.0.1`/`::1`. Closes the footgun of a typo'd or copy-pasted `http://` production URL silently producing spec-violating discovery metadata. (M-3)
+
+### Added
+- **`POST /revoke` (RFC 7009)** — authenticated token revocation for access and refresh tokens. Client authenticates via `client_secret_post`; presented token is removed from the store on success. Returns 200 on both known and unknown tokens (RFC-mandated, prevents probing). Returns 503 on store failure rather than a silent 200, so operators know a revocation did not take effect. Advertised in OAuth discovery as `revocation_endpoint`. Covered by four tests including a cross-client safety test proving a DCR'd client cannot revoke another client's tokens. (M-2)
+- **Consent page now displays client identity.** The registered `client_name` and the `redirect_uri` host are rendered on the PIN consent page (both `html.EscapeString`'d). Without this, a DCR-registered client with an attacker-controlled redirect URI was visually indistinguishable from a legitimate one — the operator had no signal they were handing the PIN to the wrong party. The redirect host is the *validated* registered value, not raw query input. (H-1)
+
+### Fixed
+- **`RateLimiter.IsRateLimited` fails closed at map saturation.** Previously, when the 100k-IP tracker hit its cap, `RecordFailure` silently no-op'd and novel IPs returned "not limited" — an attacker with a large IP pool could bypass rate limiting entirely by cycling fresh addresses. The limiter now treats untracked IPs at saturation as rate-limited, turning the DoS-on-the-limiter into a bounded, logged global lockout. Tracked IPs within their per-IP budget are unaffected, minimizing legitimate-user impact during an attack. (L-3)
+- **OAuth SQLite DB file permissions** — parent directory is now chmod'd to `0700` and the DB file to `0600` after `createTables` (SQLite creates the file lazily on first write). WAL/SHM sidecars are chmodded best-effort. Bind-mount / volume-copy scenarios no longer leak metadata (client_ids, issuance timestamps) to other UIDs. Secrets remain SHA-256 hashed at rest, so the blast radius was limited before this fix. (L-2)
+- **Default Go version in generated Dockerfiles** bumped from `1.24` to `1.25` to match the `go` directive in this module's `go.mod`. Previously, a consumer who ran `GenerateDockerfile` with no explicit version got a Dockerfile that couldn't build the library, pushing operators to drop version pinning (`FROM golang:alpine`) and lose reproducibility across the portfolio. (M-4)
+
+### Tests
+- `TestBearerMiddlewareFailsClosedOnStoreUnreachable` — seeds a valid OAuth token, closes the DB mid-request, asserts 401 and that the inner handler is not reached. Locks in the "fail-closed on store failure" property that the whole portfolio inherits.
+- `TestRevokeAccessToken`, `TestRevokeRejectsBadClientAuth`, `TestRevokeUnknownTokenReturns200`, `TestRevokeCannotTouchOtherClientsTokens` — full coverage of the new `/revoke` endpoint including the cross-client safety invariant.
+- `TestRateLimiterFailsClosedAtSaturation` — encodes the IP-cycling attack and asserts the fail-closed behavior at map cap.
+
+### Audit artifact
+- `SECURITY_AUDIT_2026-04-14.md` — full fifth-pass findings document, including the "clean" enumeration of every question the substrate already answers correctly (constant-time compares, PKCE-mandatory, hashed-at-rest, parameterized SQL, auth-before-parse, etc.) and the executable fail-closed proof.
+
 ## [v0.7.3] — 2026-04-14
 
 Fourth-pass audit. Small, focused round — no critical bugs, mostly

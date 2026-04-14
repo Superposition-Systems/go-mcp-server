@@ -89,8 +89,19 @@ func NewOAuthStore(dbPath string, scope string) (*OAuthStore, error) {
 	}
 
 	dir := filepath.Dir(dbPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	// 0700 on the parent directory is the primary protection: without
+	// execute-bit access, no other UID can stat the DB or its WAL/SHM
+	// sidecars regardless of what mode SQLite ends up creating them
+	// with. The 0600 on the main file below is defense-in-depth for
+	// bind-mount / volume-copy scenarios where only the file (not the
+	// directory mode) is preserved.
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("create db directory: %w", err)
+	}
+	// Re-apply the mode in case the directory already existed with a
+	// looser permission (e.g., MkdirAll is a no-op on existing dirs).
+	if err := os.Chmod(dir, 0700); err != nil {
+		return nil, fmt.Errorf("chmod db directory: %w", err)
 	}
 
 	db, err := sql.Open("sqlite", dbPath)
@@ -115,6 +126,22 @@ func NewOAuthStore(dbPath string, scope string) (*OAuthStore, error) {
 	if err := store.createTables(); err != nil {
 		db.Close()
 		return nil, err
+	}
+
+	// Tighten the DB file mode AFTER the first write (createTables) —
+	// SQLite creates the file lazily, and writes the WAL/SHM sidecars
+	// on the journal_mode PRAGMA. Chmod'ing earlier fails on a file
+	// that doesn't exist yet. 0644 is the typical default under a
+	// container umask; a world-readable DB leaks metadata (client_ids,
+	// issuance timestamps) even though the secrets themselves are
+	// SHA-256 hashed. Sidecar chmods are best-effort; the 0700 on the
+	// parent directory is the primary access barrier.
+	if err := os.Chmod(dbPath, 0600); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("chmod db file: %w", err)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		_ = os.Chmod(dbPath+suffix, 0600) // may not exist yet; ignore
 	}
 
 	return store, nil
@@ -500,6 +527,39 @@ func (s *OAuthStore) ConsumeRefreshToken(token, expectedClientID string) (*Token
 		return nil, fmt.Errorf("refresh token expired")
 	}
 	return &d, nil
+}
+
+// RevokeToken deletes the given token (access or refresh) from the
+// store if it is bound to expectedClientID. Returns nil if a row was
+// deleted OR if no matching row existed — per RFC 7009 §2.2, the
+// response to /revoke is indistinguishable between "unknown token"
+// and "revoked successfully." A returned error therefore always
+// represents a store-level failure, not a token-not-found condition.
+//
+// The client binding check prevents one DCR'd client from revoking
+// another client's tokens by guessing or replaying values.
+func (s *OAuthStore) RevokeToken(token, expectedClientID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	hashed := hashSecret(token)
+	// Delete from both tables; at most one will match because the two
+	// key spaces are independent hex-SHA-256 digests of unrelated
+	// random secrets. The client_id predicate is the authorization
+	// check — a mismatched client silently deletes nothing.
+	if _, err := s.db.Exec(
+		"DELETE FROM access_tokens WHERE token = ? AND client_id = ?",
+		hashed, expectedClientID,
+	); err != nil {
+		return fmt.Errorf("revoke access token: %w", err)
+	}
+	if _, err := s.db.Exec(
+		"DELETE FROM refresh_tokens WHERE token = ? AND client_id = ?",
+		hashed, expectedClientID,
+	); err != nil {
+		return fmt.Errorf("revoke refresh token: %w", err)
+	}
+	return nil
 }
 
 // StoreAuthRequest stores authorization request parameters server-side.
