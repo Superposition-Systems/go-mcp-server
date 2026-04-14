@@ -195,6 +195,35 @@ func TestStoreTokenLifecycle(t *testing.T) {
 	}
 }
 
+func TestValidateRedirectURIRejectsDangerousForms(t *testing.T) {
+	// These should all fail.
+	bad := []string{
+		"https://example.com/?",             // bare trailing ?
+		"https://example.com/#frag",         // fragment
+		"https://u:p@example.com/callback",  // userinfo
+		"https://example.com/?foo=bar",      // query string
+		"ftp://example.com/callback",        // wrong scheme
+		"http://example.com/callback",       // http non-localhost
+		"not-a-url",
+	}
+	for _, uri := range bad {
+		if err := validateRedirectURI(uri); err == nil {
+			t.Errorf("validateRedirectURI(%q) should have failed", uri)
+		}
+	}
+	// These should pass.
+	good := []string{
+		"https://example.com/callback",
+		"http://localhost:8080/callback",
+		"http://127.0.0.1/cb",
+	}
+	for _, uri := range good {
+		if err := validateRedirectURI(uri); err != nil {
+			t.Errorf("validateRedirectURI(%q) should have succeeded: %v", uri, err)
+		}
+	}
+}
+
 func TestScopeContains(t *testing.T) {
 	cases := []struct {
 		granted, required string

@@ -157,7 +157,10 @@ func (h *OAuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 
 	client, err := h.Store.RegisterClient(metadata)
 	if err != nil {
-		writeOAuthJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "server_error", "error_description": err.Error()})
+		// Don't echo the underlying error — SQLite error strings can
+		// disclose schema details to unauthenticated callers.
+		log.Printf("mcpserver: client registration failed: %v", err)
+		writeOAuthJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "server_error", "error_description": "registration failed"})
 		return
 	}
 
@@ -185,11 +188,22 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// PKCE is mandatory — require code_challenge.
-	if q.Get("code_challenge") == "" {
+	// PKCE is mandatory — require code_challenge. For S256 the output is
+	// base64url(SHA-256(verifier)), which is exactly 43 characters; we
+	// accept a small envelope above that (up to 128) to tolerate future
+	// methods without allowing 10KB+ blobs to fill the auth-request
+	// store.
+	codeChallenge := q.Get("code_challenge")
+	if codeChallenge == "" {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "code_challenge is required (PKCE S256)."))
+		return
+	}
+	if len(codeChallenge) > 128 {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "code_challenge too long."))
 		return
 	}
 
@@ -215,6 +229,12 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "state parameter is required."))
+		return
+	}
+	if len(state) > 512 {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, RenderPINPage(h.config.ConsentTitle, h.config.ConsentDescription, "", "state parameter too long."))
 		return
 	}
 
@@ -263,7 +283,7 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 		"client_id":             q.Get("client_id"),
 		"redirect_uri":          reqRedirectURI,
 		"state":                 state,
-		"code_challenge":        q.Get("code_challenge"),
+		"code_challenge":        codeChallenge,
 		"code_challenge_method": ccm,
 		"scope":                 reqScope,
 	}); err != nil {
@@ -560,7 +580,9 @@ func baseURLFromConfig(cfg OAuthConfig, r *http.Request) string {
 }
 
 // validateRedirectURI enforces RFC 6749 §3.1.2: https (or localhost http
-// for dev), and no query string or fragment component.
+// for dev), no query string or fragment component, and no userinfo
+// (credentials in a redirect URL are dangerous — they end up in browser
+// history and server logs).
 func validateRedirectURI(uri string) error {
 	u, err := url.ParseRequestURI(uri)
 	if err != nil {
@@ -569,8 +591,13 @@ func validateRedirectURI(uri string) error {
 	if u.Fragment != "" || strings.Contains(uri, "#") {
 		return fmt.Errorf("redirect_uri must not contain a fragment")
 	}
-	if u.RawQuery != "" {
+	// url.Parse treats a bare trailing "?" as RawQuery=="" so we check
+	// the raw string too.
+	if u.RawQuery != "" || strings.Contains(uri, "?") {
 		return fmt.Errorf("redirect_uri must not contain a query string")
+	}
+	if u.User != nil {
+		return fmt.Errorf("redirect_uri must not contain userinfo")
 	}
 	if u.Scheme == "https" {
 		return nil

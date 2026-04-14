@@ -237,21 +237,31 @@ func (s *Server) ListenAndServe() error {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	// Graceful shutdown
+	// Graceful shutdown: listen for SIGINT/SIGTERM OR for ListenAndServe
+	// to return on its own (e.g. bind failure). Either path releases the
+	// signal goroutine so we don't leak it on abnormal startup.
+	sigCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+	serveDone := make(chan struct{})
 	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
-		log.Println("mcpserver: shutting down...")
-		shutCtx, shutCancel := context.WithTimeout(context.Background(), s.drainTime)
-		defer shutCancel()
-		if err := srv.Shutdown(shutCtx); err != nil {
-			log.Printf("mcpserver: shutdown error: %v", err)
+		select {
+		case <-sigCtx.Done():
+			log.Println("mcpserver: shutting down...")
+			shutCtx, shutCancel := context.WithTimeout(context.Background(), s.drainTime)
+			defer shutCancel()
+			if err := srv.Shutdown(shutCtx); err != nil {
+				log.Printf("mcpserver: shutdown error: %v", err)
+			}
+		case <-serveDone:
+			// ListenAndServe returned before any signal arrived. Nothing
+			// to do — the defer on stopSignals releases signal.Notify.
 		}
 	}()
 
-	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-		return fmt.Errorf("mcpserver: %w", err)
+	serveErr := srv.ListenAndServe()
+	close(serveDone)
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		return fmt.Errorf("mcpserver: %w", serveErr)
 	}
 	return nil
 }

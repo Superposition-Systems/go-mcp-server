@@ -19,11 +19,11 @@
 //
 // Test MCP (requires Bearer token — set BEARER_TOKEN or AUTH_PIN env var):
 //
-//	BEARER_TOKEN=my-secret go run .
+//	BEARER_TOKEN=YOUR_TOKEN_HERE go run .
 //	curl -X POST http://localhost:8080/mcp \
 //	  -H "Content-Type: application/json" \
 //	  -H "Accept: application/json, text/event-stream" \
-//	  -H "Authorization: Bearer my-secret" \
+//	  -H "Authorization: Bearer YOUR_TOKEN_HERE" \
 //	  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 package main
 

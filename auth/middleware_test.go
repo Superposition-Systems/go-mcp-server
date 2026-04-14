@@ -207,6 +207,50 @@ func TestBearerMiddlewareOAuthToken(t *testing.T) {
 	}
 }
 
+func TestParseBearerRejectsMalformed(t *testing.T) {
+	cases := map[string]string{
+		"":                "",
+		"Bearer":          "",
+		"Bearer ":         "",
+		"Bearer  token":   "", // double space
+		"Bearer\ttoken":   "", // tab instead of space
+		"Bearer token\n":  "", // trailing newline
+		"Bearer to ken":   "", // internal space
+		"Basic token":     "",
+		"Bearer token":    "token",
+		"bearer token":    "token", // case-insensitive scheme
+		"BEARER token123": "token123",
+	}
+	for in, want := range cases {
+		got := parseBearer(in)
+		if got != want {
+			t.Errorf("parseBearer(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestVerifyClientSecretConstantTime(t *testing.T) {
+	// Smoke test: unknown client_id returns false, known client with
+	// wrong secret returns false, known client with right secret
+	// returns true.
+	store := newTestStore(t)
+	client, err := store.RegisterClient(map[string]any{
+		"redirect_uris": []any{"http://localhost/callback"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.VerifyClientSecret("no-such-client", "anything") {
+		t.Error("unknown client_id must not verify")
+	}
+	if store.VerifyClientSecret(client.ClientID, "wrong") {
+		t.Error("wrong secret must not verify")
+	}
+	if !store.VerifyClientSecret(client.ClientID, client.ClientSecret) {
+		t.Error("correct secret must verify")
+	}
+}
+
 func TestBearerMiddlewareMultipleProtectedPaths(t *testing.T) {
 	store := newTestStore(t)
 	middleware := BearerMiddleware("tok", nil, store, "", "/mcp", "/api")

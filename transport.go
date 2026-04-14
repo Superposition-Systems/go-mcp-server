@@ -68,6 +68,28 @@ func handlePost(w http.ResponseWriter, r *http.Request, info ServerInfo, tools T
 		})
 		return
 	}
+	// JSON-RPC 2.0 §4.2: id MUST be a string, number, or null. We also
+	// cap string ids at 256 bytes so we do not echo arbitrarily large
+	// attacker-controlled content in every response.
+	if !validRPCID(req.ID) {
+		writeSSE(w, JSONRPCResponse{
+			JSONRPC: "2.0",
+			ID:      nil,
+			Error:   &RPCError{Code: -32600, Message: "Invalid Request: id must be a string, number, or null"},
+		})
+		return
+	}
+	// Cap Params to 1 MB of raw JSON — tool arguments should never need
+	// more than that, and the decoded object graph can be substantially
+	// larger than the encoded byte count.
+	if len(req.Params) > 1<<20 {
+		writeSSE(w, JSONRPCResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error:   &RPCError{Code: -32600, Message: "Invalid Request: params too large"},
+		})
+		return
+	}
 
 	switch req.Method {
 	case "initialize":
@@ -175,6 +197,23 @@ func writeSSE(w http.ResponseWriter, resp JSONRPCResponse) {
 
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
+	}
+}
+
+// validRPCID enforces JSON-RPC 2.0's rule that id is string, number, or
+// null. Strings are capped at 256 bytes so pathological ids cannot be
+// echoed back in every response. Numbers are allowed as-is (decoded as
+// float64 or json.Number depending on the decoder configuration).
+func validRPCID(id any) bool {
+	switch v := id.(type) {
+	case nil:
+		return true
+	case string:
+		return len(v) <= 256
+	case float64, json.Number, int, int64:
+		return true
+	default:
+		return false
 	}
 }
 

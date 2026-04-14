@@ -179,6 +179,12 @@ var ErrInvalidBootstrapToken = errors.New("invalid or missing bootstrap token")
 // timestamps) in SQLite. A non-empty envPassword overrides the stored
 // password for the lifetime of this process — useful for strict-mode
 // deployments that want to bypass the bootstrap window entirely.
+//
+// Note: if the DB already contains a stored password from a previous
+// run and envPassword is also set for the current run, the stored
+// password is ignored (never consulted and never deleted). Removing the
+// env var on a subsequent run will restore the stored password. This
+// is intentional — strict mode wins cleanly while it is in effect.
 type PasswordStore struct {
 	db             *sql.DB
 	mu             sync.Mutex
@@ -356,6 +362,13 @@ func (p *PasswordStore) Rotate(currentPassword, newPassword string) error {
 
 // Verify returns true if password matches the configured secret. Returns
 // false in bootstrap mode (no password means nothing to verify against).
+//
+// Callers should gate with IsSet() before calling Verify — the
+// row-absent branch short-circuits before running PBKDF2, which makes
+// the "no password set" case much faster than a wrong-password case.
+// If a caller uses Verify to probe whether a password is configured,
+// the timing gap would leak bootstrap status. All in-tree callers
+// front with IsSet(), so this is a latent hazard, not an active one.
 func (p *PasswordStore) Verify(password string) bool {
 	if p.envPassword != "" {
 		return SafeEqual(password, p.envPassword)
@@ -562,13 +575,23 @@ func (e *Elevation) Elevate(ctx context.Context, password string) (time.Time, er
 // context with the result of HasCurrentSession, so downstream handlers
 // can call IsElevated(ctx) as the canonical check. This must be wired
 // AFTER BearerMiddleware (which puts the token hash on the context).
+//
+// The elevation state is snapshotted ONCE at middleware entry. A tool
+// handler that runs for up to WithTimeout will retain that snapshot
+// even if the operator rotates the password mid-call (RevokeAll clears
+// grants immediately but the in-flight ctx value is immutable). For
+// long-running operations that must honor emergency revocation, re-check
+// e.HasCurrentSession(ctx) periodically inside the tool. The maximum
+// lag between RevokeAll and a stamped ctx becoming stale equals the
+// server's request timeout.
+//
+// Callers must not invoke this on a nil *Elevation — guard at the call
+// site (server.go does this). The nil check is intentionally absent
+// here so a programming error fails loudly rather than silently
+// letting requests through without elevation stamping.
 func (e *Elevation) Middleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if e == nil {
-				next.ServeHTTP(w, r)
-				return
-			}
 			ctx := WithElevated(r.Context(), e.HasCurrentSession(r.Context()))
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})

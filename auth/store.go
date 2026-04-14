@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -261,16 +262,24 @@ func (s *OAuthStore) GetClient(clientID string) (*ClientData, error) {
 }
 
 // VerifyClientSecret returns true if the presented secret matches the
-// hash stored for clientID. Comparison is constant-time against the
-// stored hash (SQL equality on a fixed-length digest leaks no length
-// information about the raw secret).
+// hash stored for clientID. The work done is identical regardless of
+// whether clientID is registered, so timing does not disclose which
+// client IDs exist. The comparison is constant-time.
 func (s *OAuthStore) VerifyClientSecret(clientID, secret string) bool {
+	// Compute the presented hash unconditionally so the unknown-client
+	// branch pays the same CPU cost as the wrong-secret branch.
+	presented := hashSecret(secret)
+
 	var storedHash string
 	err := s.db.QueryRow("SELECT client_secret FROM clients WHERE client_id = ?", clientID).Scan(&storedHash)
 	if err != nil {
+		// Burn the same constant-time compare so both code paths take
+		// the same time; `presented` is a 64-char hex string so the
+		// comparison length matches a real stored_hash.
+		subtle.ConstantTimeCompare([]byte(presented), []byte(presented))
 		return false
 	}
-	return SafeEqual(hashSecret(secret), storedHash)
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(storedHash)) == 1
 }
 
 // StoreAuthCode persists an authorization code. The code is stored as a

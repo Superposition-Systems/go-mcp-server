@@ -85,22 +85,30 @@ func (s *Server) wrapToolsWithElevation(user ToolHandler) ToolHandler {
 		return user
 	}
 	prefix := s.elevationToolPrefix()
-	return &elevationTools{
+	et := &elevationTools{
 		inner:   user,
 		elev:    s.Elevation(),
 		elevate: prefix + "_elevate",
 		setPwd:  prefix + "_set_elevation_password",
 	}
+	// Precompute user tool names once. Calling ListTools per dispatch
+	// was both O(n) and TOCTOU-sensitive if ListTools is non-deterministic.
+	et.userNames = make(map[string]struct{})
+	for _, t := range user.ListTools() {
+		et.userNames[t.Name] = struct{}{}
+	}
+	return et
 }
 
 // elevationTools composes the user's tool handler with the two elevation
 // tools. List returns user_tools ++ library_tools; Call dispatches by
 // name, preferring user_tools on collision.
 type elevationTools struct {
-	inner   ToolHandler
-	elev    *auth.Elevation
-	elevate string // e.g. "vps_elevate"
-	setPwd  string // e.g. "vps_set_elevation_password"
+	inner     ToolHandler
+	elev      *auth.Elevation
+	elevate   string // e.g. "vps_elevate"
+	setPwd    string // e.g. "vps_set_elevation_password"
+	userNames map[string]struct{}
 }
 
 func (e *elevationTools) ListTools() []ToolDef {
@@ -166,11 +174,9 @@ func (e *elevationTools) ListTools() []ToolDef {
 }
 
 func (e *elevationTools) Call(ctx context.Context, name string, args map[string]any) (any, bool) {
-	// Prefer user handler on collision.
-	for _, t := range e.inner.ListTools() {
-		if t.Name == name {
-			return e.inner.Call(ctx, name, args)
-		}
+	// Prefer user handler on collision (precomputed at construction).
+	if _, isUser := e.userNames[name]; isUser {
+		return e.inner.Call(ctx, name, args)
 	}
 	switch name {
 	case e.elevate:

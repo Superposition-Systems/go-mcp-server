@@ -73,16 +73,25 @@ func (rl *RateLimiter) prune(ip string) {
 
 // parseBearer extracts the token from an RFC 6750-compliant Authorization
 // header. The scheme match is case-insensitive; the token must be
-// non-empty after the single mandatory SP. Returns "" if the header is
-// not a usable Bearer credential.
+// non-empty and must not itself contain whitespace — RFC 6750 §2.1
+// mandates exactly one SP between the scheme and the token.
 func parseBearer(header string) string {
-	if len(header) < 7 {
+	if len(header) < 8 {
+		// Minimum is "Bearer X" — 7 bytes for "Bearer " + at least 1 char.
 		return ""
 	}
 	if !strings.EqualFold(header[:6], "Bearer") || header[6] != ' ' {
 		return ""
 	}
-	return strings.TrimSpace(header[7:])
+	tok := header[7:]
+	// Any embedded whitespace (including extra spaces, tabs, CR, LF) is
+	// non-conforming and must not be silently normalized away: a second
+	// space would turn "Bearer  X" into "X", which is not what the
+	// client sent.
+	if strings.ContainsAny(tok, " \t\r\n") {
+		return ""
+	}
+	return tok
 }
 
 // writeUnauthorized emits an RFC 6750 §3-compliant 401 with the
@@ -101,14 +110,20 @@ func writeUnauthorized(w http.ResponseWriter, description string) {
 }
 
 // sanitizeChallenge strips characters that would break the quoted
-// challenge description (the WWW-Authenticate grammar is unforgiving).
+// challenge description (the WWW-Authenticate grammar is unforgiving)
+// and caps the result at 200 bytes so a future caller passing a
+// user-controlled description cannot produce an unbounded header value.
 func sanitizeChallenge(s string) string {
-	return strings.Map(func(r rune) rune {
+	out := strings.Map(func(r rune) rune {
 		if r == '"' || r == '\\' || r < 0x20 {
 			return -1
 		}
 		return r
 	}, s)
+	if len(out) > 200 {
+		out = out[:200]
+	}
+	return out
 }
 
 // BearerMiddleware creates HTTP middleware that requires a valid Bearer token

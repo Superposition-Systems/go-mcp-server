@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.7.1] — 2026-04-14
+
+Second-pass audit follow-up: fixes stragglers found after the v0.7.0
+hardening landed. All changes are backwards-compatible except the
+`elevationTools` struct layout (internal only).
+
+### Fixed
+- **`parseBearer` silently stripped whitespace in the token position** — `Bearer  token` (double space) and `Bearer\ttoken` now fail instead of being quietly normalized. RFC 6750 §2.1 mandates exactly one SP. (H1)
+- **`VerifyClientSecret` timing oracle on unknown `client_id`** — the unknown-client branch bypassed the SHA-256 hash entirely, letting an attacker enumerate valid client IDs via microsecond-scale timing. Both branches now hash unconditionally. (H2)
+- **Shutdown goroutine leaked on non-signal `ListenAndServe` exit** (e.g. bind failure). Switched to `signal.NotifyContext` and a done-channel so the goroutine always terminates. (H3)
+- **`req.ID` and `req.Params` were unbounded** — a JSON-RPC request with an enormous `id` was re-echoed in every response. `id` is now validated to be string/number/null, strings capped at 256 bytes, and `params` is capped at 1 MB of raw JSON. (H4)
+- **`RegisterClient` leaked SQLite error details** in `error_description`. Now logs server-side and returns a generic message. (M3)
+- **`validateRedirectURI` accepted a bare `?` suffix and `userinfo`** (credentials in URLs end up in browser history / server logs). Both are now rejected. (M4)
+- **`state` and `code_challenge` had no length cap** — 10,000-row auth-request store × unbounded TEXT fields enabled disk DoS. Now 512 bytes and 128 bytes respectively. (M5)
+- **Dead `if e == nil` guard** inside `Elevation.Middleware()` closure removed; docstring explains why the method is deliberately nil-unsafe. (M1)
+- **`elevationTools.Call` probed `e.inner.ListTools()` on every dispatch** — O(n) and TOCTOU-sensitive if `ListTools` is non-deterministic. User tool names are now precomputed once at wrap time. (M2)
+- **`sanitizeChallenge`** now caps its output at 200 bytes as defense-in-depth for future callers passing user-controlled descriptions. (L2)
+
+### Documentation
+- `PasswordStore.Verify` docstring warns that the row-absent branch short-circuits PBKDF2; all callers must front with `IsSet()`. (L5)
+- `Elevation.Middleware` docstring documents the snapshot semantics and max-revocation-latency (= request timeout) for in-flight tool calls. (L6)
+- `PasswordStore` type doc explains env-vs-DB coexistence (env wins cleanly while set; stored password is preserved and re-activated when env is removed). (L7)
+- `WithOAuthDBPath` docstring notes the distroless-container pitfall on the `/data/oauth.db` default. (L3)
+- `example/main.go`: replaced literal `my-secret` in curl snippets with `YOUR_TOKEN_HERE` to prevent copy-paste credential leaks. (L4)
+
+### Tests
+- New `TestParseBearerRejectsMalformed` covers case-insensitive scheme match, rejection of double-space / tab / trailing newline / internal space.
+- New `TestVerifyClientSecretConstantTime` smoke-tests unknown / wrong / correct cases.
+- New `TestValidateRedirectURIRejectsDangerousForms` covers bare `?`, fragments, userinfo, wrong scheme.
+
 ## [v0.7.0] — 2026-04-14
 
 Security hardening round following a multi-agent audit of the OAuth flow,

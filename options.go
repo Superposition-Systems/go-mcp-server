@@ -81,6 +81,10 @@ func WithAuth(cfg auth.OAuthConfig) Option {
 
 // WithOAuthDBPath sets the SQLite database path for OAuth state
 // (default reads from OAUTH_DB_PATH env, fallback "/data/oauth.db").
+//
+// For distroless or other read-only container filesystems, ensure the
+// target directory exists and is writable (mount a volume at /data, or
+// set OAUTH_DB_PATH to a tmpfs location such as /tmp/oauth.db).
 func WithOAuthDBPath(path string) Option {
 	return func(s *Server) { s.oauthDBPath = path }
 }

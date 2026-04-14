@@ -50,10 +50,11 @@ func TestElevationTools_ListIncludesBothLibraryTools(t *testing.T) {
 
 func TestElevationTools_UserToolShadowsLibraryOnCollision(t *testing.T) {
 	et := &elevationTools{
-		inner:   &stubInner{tools: []ToolDef{{Name: "vps_elevate"}}}, // user registered the same name
-		elev:    newTestElevation(t),
-		elevate: "vps_elevate",
-		setPwd:  "vps_set_elevation_password",
+		inner:     &stubInner{tools: []ToolDef{{Name: "vps_elevate"}}}, // user registered the same name
+		elev:      newTestElevation(t),
+		elevate:   "vps_elevate",
+		setPwd:    "vps_set_elevation_password",
+		userNames: map[string]struct{}{"vps_elevate": {}},
 	}
 	got := et.ListTools()
 	// Only one "vps_elevate" should appear (user's) and the library's set_password still shows.
