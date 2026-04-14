@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.6.0] — 2026-04-14
+
+### Added
+- **Elevation (step-up auth)**: New `WithElevation(ElevationConfig)` option enables a session-scoped elevation feature. Registers two tools automatically (`<prefix>_elevate` and `<prefix>_set_elevation_password`) and exposes `Server.Elevation()` for apps to fold into their own health / write-gate logic.
+- **Bootstrap mode**: When no password is configured, every authenticated session is treated as elevated until the first `set_elevation_password` call closes the window. Intended for first-install convenience. Strict-mode deployments can set `EnvPasswordVar` to bypass bootstrap entirely.
+- **`auth.PasswordStore`**: SQLite-backed hashed-password store using stdlib `crypto/pbkdf2` (SHA-256, 600k iterations). Tracks `set_at` and `last_rotated_at`. Rotation requires the current password.
+- **`auth.GrantStore`**: In-memory TTL-keyed "this key is currently elevated" primitive, reusable for any time-bounded permission feature (not just elevation).
+- **`auth.Elevation`**: Composes the two stores with a configurable TTL. Provides `HasCurrentSession(ctx)`, `Elevate(ctx, password)`, `IsBootstrap()`.
+- **Token hash on context**: `BearerMiddleware` now stashes `auth.TokenHash(token)` on the request context on every successful auth. Retrievable via `auth.GetTokenHash(ctx)` as a stable session identifier that never exposes the raw token.
+- **`auth.WithElevated` / `auth.IsElevated`**: Forward-compatible context helpers for middleware-tagged elevation state.
+
+### Changed
+- `BearerMiddleware` now calls `WithTokenHash` on success paths — non-breaking, adds data to ctx without affecting existing handlers.
+
 ## [v0.5.0] — 2026-04-13
 
 ### Added
@@ -90,6 +104,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Graceful shutdown with configurable drain window.
 - Pure-Go SQLite via modernc.org/sqlite (CGO-free, distroless compatible).
 
+[v0.6.0]: https://github.com/Superposition-Systems/go-mcp-server/compare/v0.5.0...v0.6.0
 [v0.5.0]: https://github.com/Superposition-Systems/go-mcp-server/compare/v0.4.0...v0.5.0
 [v0.4.0]: https://github.com/Superposition-Systems/go-mcp-server/compare/v0.3.0...v0.4.0
 [v0.3.0]: https://github.com/Superposition-Systems/go-mcp-server/compare/v0.2.0...v0.3.0

@@ -142,6 +142,7 @@ All options are passed to `New()`:
 | `WithOAuthDBPath(path)` | `OAUTH_DB_PATH` env or `/data/oauth.db` | SQLite database path |
 | `WithAuth(cfg)` | — | Full `OAuthConfig` struct |
 | `WithMiddleware(mw)` | `nil` | Outer middleware (runs before auth) |
+| `WithElevation(cfg)` | `nil` | Enables step-up-auth elevation (see [Elevation](#elevation)) |
 
 ### Environment Variables
 
@@ -215,6 +216,72 @@ Client                          Server                          User
 ### Bearer Middleware
 
 Only paths matching the MCP endpoint (default `/mcp`) require authentication. All other paths — health checks, OAuth endpoints, and user-mounted routes — pass through without auth. Use a reverse proxy for infrastructure-level access control on other routes.
+
+On successful auth, `BearerMiddleware` stashes a SHA-256 hash of the presented token on the request context (`auth.GetTokenHash(ctx)`). Handlers can use this as a stable session identifier — for per-session state, step-up elevation, or any feature that needs to answer *"is this the same caller as before?"* without ever touching the raw token.
+
+## Elevation
+
+Opt-in step-up-authentication feature. When configured via `WithElevation(ElevationConfig{...})`, the server exposes two extra tools — `<prefix>_elevate` and `<prefix>_set_elevation_password` — that let an authenticated session temporarily promote itself to write access by proving knowledge of an elevation password.
+
+The intended use case: distinguishing *read-only* sessions (e.g. a cloud connector holding an OAuth token) from *write-capable* sessions, without requiring a second credential store or re-auth flow. The elevation is ephemeral (in-memory, TTL-bounded) and scoped to the specific token that called `elevate` — other sessions holding other tokens are unaffected.
+
+### Bootstrap mode
+
+When no password is configured (neither stored on disk nor supplied via the env var), the server runs in **bootstrap mode**: every authenticated session is treated as elevated by default. This is the one-time window in which an operator calls `set_elevation_password` to establish the secret and close bootstrap mode. Intended for first-install convenience; the window is only as wide as the time between deploy and first configuration call, and is already gated by the outer bearer-token layer.
+
+If that tradeoff is unacceptable (e.g. production deploys where no free-access window should ever exist), configure `EnvPasswordVar` and set that environment variable at startup. The env value becomes the elevation password, bootstrap mode is disabled, and runtime rotation is refused (rotate by changing the env var and restarting).
+
+### Configuration
+
+```go
+srv := mcpserver.New(
+    // ...other options...
+    mcpserver.WithElevation(mcpserver.ElevationConfig{
+        DBPath:         "/data/elevation.db",        // required — SQLite path
+        GrantTTL:       10 * time.Minute,            // default 10m
+        EnvPasswordVar: "MY_ELEVATION_PASSWORD",     // optional strict-mode override
+        ToolNamePrefix: "",                          // defaults to server name, hyphen→underscore
+    }),
+)
+```
+
+### Registered tools
+
+The library prefixes these with the server name (hyphens → underscores) unless `ToolNamePrefix` overrides it.
+
+| Tool | Arguments | Behavior |
+|---|---|---|
+| `<prefix>_elevate` | `password` | Grants elevation to the current session for `GrantTTL`. No-op success in bootstrap mode. |
+| `<prefix>_set_elevation_password` | `new_password` + (when rotating) `current_password` | Establishes first password or rotates. Rotation revokes all active elevations. |
+
+### Composing with handler-level checks
+
+The server doesn't enforce elevation on any tool automatically — that's policy the app owns. Check it inside any write-gated handler:
+
+```go
+func (t *MyTools) handleWrite(ctx context.Context, args map[string]any) (any, bool) {
+    if !t.elev.HasCurrentSession(ctx) {
+        return map[string]any{"error": "write requires elevation"}, true
+    }
+    // ...
+}
+```
+
+Fetch the handle during tool construction — `srv.Elevation()` is safe to call before `ListenAndServe()` (the underlying stores open lazily on first access):
+
+```go
+tools := NewMyTools(cfg, srv.Elevation())
+srv.RegisterTools(tools)
+```
+
+### Primitives
+
+For apps that want finer control than the bundled tools, the underlying primitives in `auth/elevation.go` can be used directly:
+
+- `auth.PasswordStore` — persistent hashed-password store (PBKDF2-SHA256, 600k iterations, stdlib `crypto/pbkdf2`)
+- `auth.GrantStore` — in-memory TTL-keyed "is this key currently elevated" store
+- `auth.Elevation` — composes both with a configured TTL; provides `HasCurrentSession(ctx)`, `Elevate(ctx, password)`, etc.
+- `auth.TokenHash(token)`, `auth.GetTokenHash(ctx)` — stable per-session identity derived from the bearer token
 
 ## Security
 

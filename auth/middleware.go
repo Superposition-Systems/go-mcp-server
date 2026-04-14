@@ -111,21 +111,29 @@ func BearerMiddleware(bearerToken string, tokenValidator func(string) bool, stor
 
 			token := authHeader[7:]
 
+			// On any successful auth path, stash a hash of the token on the
+			// context so downstream handlers can identify this session without
+			// ever touching the raw secret.
+			passWithHash := func() {
+				ctx := WithTokenHash(r.Context(), TokenHash(token))
+				next.ServeHTTP(w, r.WithContext(ctx))
+			}
+
 			// Custom token validator (supports multi-token, scoped auth, etc.)
 			if tokenValidator != nil && tokenValidator(token) {
-				next.ServeHTTP(w, r)
+				passWithHash()
 				return
 			}
 
 			// Static bearer token (CLI tools)
 			if bearerToken != "" && SafeEqual(token, bearerToken) {
-				next.ServeHTTP(w, r)
+				passWithHash()
 				return
 			}
 
 			// OAuth access token (claude.ai)
 			if store != nil && store.VerifyAccessToken(token, requiredScope) {
-				next.ServeHTTP(w, r)
+				passWithHash()
 				return
 			}
 

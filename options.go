@@ -120,3 +120,46 @@ func WithMiddleware(mw func(http.Handler) http.Handler) Option {
 		s.outerMiddleware = mw
 	}
 }
+
+// ElevationConfig configures the built-in step-up authentication feature.
+// When a server is constructed WithElevation, the library:
+//
+//   - Opens a SQLite store at DBPath for the hashed password
+//   - Registers two tools: <ToolNamePrefix>_elevate and
+//     <ToolNamePrefix>_set_elevation_password
+//   - Exposes Server.Elevation() so apps can check session state and
+//     fold elevation info into their health responses
+//
+// In bootstrap mode (no password configured, no env override), every
+// authenticated session is treated as elevated — this is the one-time
+// window in which an operator calls set_elevation_password to close it.
+//
+// If EnvPasswordVar is set and that env var is non-empty at startup, the
+// server runs in strict mode: the env password is the source of truth,
+// bootstrap mode is disabled, and runtime rotation is refused.
+type ElevationConfig struct {
+	// DBPath is the SQLite path for the password store. Required.
+	DBPath string
+
+	// GrantTTL is how long an elevation lasts after a successful call to
+	// elevate (default 10 minutes).
+	GrantTTL time.Duration
+
+	// EnvPasswordVar is the env var consulted for a strict-mode password
+	// override (e.g. "MCP_ELEVATION_PASSWORD"). Leave empty to disable.
+	EnvPasswordVar string
+
+	// ToolNamePrefix is prepended to the two registered tool names. If
+	// empty, the server name is used (with hyphens replaced by underscores).
+	ToolNamePrefix string
+}
+
+// WithElevation enables the step-up-auth elevation feature. See
+// ElevationConfig for details. When this option is not set, none of the
+// elevation machinery is constructed and Server.Elevation() returns nil.
+func WithElevation(cfg ElevationConfig) Option {
+	return func(s *Server) {
+		c := cfg
+		s.elevationConfig = &c
+	}
+}

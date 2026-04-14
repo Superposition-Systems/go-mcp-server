@@ -38,6 +38,15 @@ type Server struct {
 	oauthDBPath string
 	routeOnce   sync.Once
 	outerMiddleware func(http.Handler) http.Handler // applied outside bearer auth
+
+	// Elevation (optional). Configured via WithElevation. The stores open
+	// lazily on first Elevation() call so apps can fetch the handle during
+	// tool construction, before ListenAndServe runs.
+	elevationConfig *ElevationConfig
+	elevationOnce   sync.Once
+	elevationErr    error
+	elevation       *auth.Elevation
+	elevationPwd    *auth.PasswordStore
 }
 
 // New creates a new MCP server with the given options.
@@ -113,6 +122,21 @@ func (s *Server) ListenAndServe() error {
 	// Resolve ResourcePath from mcpPath if not explicitly set via WithAuth
 	if s.oauthConfig.ResourcePath == "" {
 		s.oauthConfig.ResourcePath = s.mcpPath
+	}
+
+	// Initialize elevation (no-op if WithElevation was not set). The lazy
+	// accessor may have already run this during app-side tool construction,
+	// in which case the once.Do is a no-op here.
+	if s.elevationConfig != nil {
+		s.Elevation()
+		if s.elevationErr != nil {
+			return fmt.Errorf("mcpserver: %w", s.elevationErr)
+		}
+		if s.elevationPwd != nil {
+			defer s.elevationPwd.Close()
+		}
+		// Wrap the user's tool handler to add library-level elevation tools.
+		s.tools = s.wrapToolsWithElevation(s.tools)
 	}
 
 	// OAuth store
