@@ -1,28 +1,249 @@
 package mcpserver
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/Superposition-Systems/go-mcp-server/suggest"
+)
 
 // MuxConfig configures a mux-mode dispatcher. See §4.4.
+//
+// Prefix, Skill, HealthCheck, Compact, and GlobalParamAliases mirror the
+// §4.4 sketch. SuggestionHook is an additive field over §4.4 (documented
+// per the §4.11 Hook contract) that lets a mux-owned consumer fire
+// EventUnknownTool without having to reach back into a Server. Callers
+// typically pass the same suggest.Hook they installed via
+// WithSuggestionHook; the mux is self-contained so a nil hook silently
+// skips event emission.
 type MuxConfig struct {
-	Prefix             string
-	Skill              SkillBuilder
-	HealthCheck        func(ctx context.Context) (map[string]any, error)
-	Compact            bool
+	// Prefix is the tool-name prefix for the 4 dispatch tools. Empty
+	// falls back to "mcp". Tool names use underscore separator per §3.6:
+	// <prefix>_execute, <prefix>_list_tools, <prefix>_health,
+	// <prefix>_get_skill.
+	Prefix string
+
+	// Skill renders the markdown content returned by <prefix>_get_skill.
+	// If nil, DefaultSkillBuilder(SkillOptions{}) is used.
+	Skill SkillBuilder
+
+	// HealthCheck, when non-nil, is invoked by <prefix>_health. If nil,
+	// <prefix>_health returns {"status": "ok"}.
+	HealthCheck func(ctx context.Context) (map[string]any, error)
+
+	// Compact, when true, applies CompactREST() to successful results
+	// from <prefix>_execute. Tool-level errors bypass compaction.
+	Compact bool
+
+	// GlobalParamAliases is reserved for §4.10 alias middleware wiring.
+	// It is not consumed by the mux itself — the alias-middleware track
+	// will install these as the global map on the Server. The field
+	// lives on MuxConfig so a single MuxConfig can configure both.
 	GlobalParamAliases map[string]string
+
+	// SuggestionHook, when non-nil, receives one EventUnknownTool event
+	// per unknown tool name seen by <prefix>_execute. Additive over §4.4
+	// per the §4.11 Hook contract: must be safe for concurrent use and
+	// must not block. Callers typically pass the same hook they
+	// installed via WithSuggestionHook on the Server.
+	SuggestionHook suggest.Hook
+}
+
+// muxPrefix returns the effective prefix (fallback "mcp").
+func muxPrefix(cfg MuxConfig) string {
+	if cfg.Prefix == "" {
+		return "mcp"
+	}
+	return cfg.Prefix
 }
 
 // NewMux wraps a Registry and returns a new Registry that exposes exactly
 // 4 dispatcher tools instead of the underlying tools:
 //
 //	<prefix>_execute     — dispatch any operation by name with a payload
-//	<prefix>_list_tools  — discover operations, filter by category
+//	<prefix>_list_tools  — discover operations, filter by category/tag
 //	<prefix>_health      — optional HealthCheck result
-//	<prefix>_get_skill   — routing guide content from cfg.Skill
+//	<prefix>_get_skill   — routing-guide content from cfg.Skill
 //
-// Phase 0 minimal impl: returns the underlying registry unchanged so
-// dependent code compiles. Session 2 (track 3B) replaces this with the
-// full 4-tool dispatcher registering into a fresh Registry.
+// The returned Registry is fresh: the underlying Registry is not mutated.
+// Unknown-tool dispatches run suggest.Closest and, when SuggestionHook is
+// non-nil, fire suggest.EventUnknownTool. When cfg.Compact is true the
+// execute tool applies CompactREST() to successful results.
 func NewMux(underlying *Registry, cfg MuxConfig) *Registry {
-	_ = cfg
-	return underlying
+	prefix := muxPrefix(cfg)
+	out := NewRegistry()
+
+	// Resolve skill builder once — consumers can override per MuxConfig.
+	skillFn := cfg.Skill
+	if skillFn == nil {
+		skillFn = DefaultSkillBuilder(SkillOptions{})
+	}
+
+	// Compaction transformer; nil when disabled.
+	var compact ResponseTransformer
+	if cfg.Compact {
+		compact = CompactREST()
+	}
+
+	out.MustRegister(Tool{
+		Name:        prefix + "_execute",
+		Description: "Dispatch any underlying operation by name. Pass the tool name in 'tool' and its arguments in 'args'.",
+		InputSchema: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "tool": {"type": "string", "description": "Name of the underlying tool to dispatch."},
+    "args": {"type": "object", "description": "Arguments passed to the underlying tool's handler."}
+  },
+  "required": ["tool"]
+}`),
+		Handler: muxExecuteHandler(underlying, cfg.SuggestionHook, compact),
+	})
+
+	out.MustRegister(Tool{
+		Name:        prefix + "_list_tools",
+		Description: "List the underlying operations available to " + prefix + "_execute. Optionally filter by category or tag.",
+		InputSchema: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "category": {"type": "string", "description": "Return only tools whose Category matches this value."},
+    "tag": {"type": "string", "description": "Return only tools whose Tags contain this value."}
+  }
+}`),
+		Handler: muxListToolsHandler(underlying),
+	})
+
+	out.MustRegister(Tool{
+		Name:        prefix + "_health",
+		Description: "Return server health. Reports {\"status\": \"ok\"} by default, or the result of the configured HealthCheck.",
+		InputSchema: json.RawMessage(`{"type": "object", "properties": {}}`),
+		Handler:     muxHealthHandler(cfg.HealthCheck),
+	})
+
+	out.MustRegister(Tool{
+		Name:        prefix + "_get_skill",
+		Description: "Return the markdown routing guide for this mux. Call " + prefix + "_list_tools for full schemas.",
+		InputSchema: json.RawMessage(`{"type": "object", "properties": {}}`),
+		Handler:     muxGetSkillHandler(underlying, skillFn),
+	})
+
+	return out
 }
+
+// muxExecuteHandler returns the handler for <prefix>_execute.
+func muxExecuteHandler(underlying *Registry, hook suggest.Hook, compact ResponseTransformer) func(context.Context, map[string]any) (any, error) {
+	return func(ctx context.Context, args map[string]any) (any, error) {
+		name, _ := args["tool"].(string)
+		if name == "" {
+			return nil, fmt.Errorf("missing required argument \"tool\"")
+		}
+		inner, _ := args["args"].(map[string]any)
+		if inner == nil {
+			inner = map[string]any{}
+		}
+
+		t, ok := underlying.Lookup(name)
+		if !ok {
+			// Build candidate list from the underlying registry.
+			all := underlying.All()
+			names := make([]string, 0, len(all))
+			for _, u := range all {
+				names = append(names, u.Name)
+			}
+			suggestions := suggest.Closest(name, names, 3)
+
+			if hook != nil {
+				ev := suggest.Event{
+					Kind:      suggest.EventUnknownTool,
+					Tool:      "",
+					Requested: name,
+					Timestamp: time.Now(),
+				}
+				if len(suggestions) > 0 {
+					ev.Suggested = suggestions[0]
+				}
+				hook(ev)
+			}
+
+			if len(suggestions) == 0 {
+				return nil, fmt.Errorf("unknown tool %q", name)
+			}
+			return nil, fmt.Errorf("unknown tool %q — did you mean: %s?", name, strings.Join(suggestions, ", "))
+		}
+
+		result, err := t.Handler(ctx, inner)
+		if err != nil {
+			// Tool-level errors bypass compaction per §4.3.
+			return nil, err
+		}
+		if compact != nil {
+			result = compact(name, result)
+		}
+		return result, nil
+	}
+}
+
+// muxListToolsHandler returns the handler for <prefix>_list_tools.
+func muxListToolsHandler(underlying *Registry) func(context.Context, map[string]any) (any, error) {
+	return func(ctx context.Context, args map[string]any) (any, error) {
+		wantCategory, _ := args["category"].(string)
+		wantTag, _ := args["tag"].(string)
+
+		all := underlying.All() // already sorted by name
+		out := make([]map[string]any, 0, len(all))
+		for _, t := range all {
+			if wantCategory != "" && t.Category != wantCategory {
+				continue
+			}
+			if wantTag != "" && !containsTag(t.Tags, wantTag) {
+				continue
+			}
+			entry := map[string]any{
+				"name":        t.Name,
+				"description": t.Description,
+				"category":    t.Category,
+				"tags":        append([]string(nil), t.Tags...),
+			}
+			out = append(out, entry)
+		}
+		return map[string]any{"tools": out}, nil
+	}
+}
+
+// containsTag reports whether tags contains the given value.
+func containsTag(tags []string, want string) bool {
+	for _, t := range tags {
+		if t == want {
+			return true
+		}
+	}
+	return false
+}
+
+// muxHealthHandler returns the handler for <prefix>_health.
+func muxHealthHandler(check func(context.Context) (map[string]any, error)) func(context.Context, map[string]any) (any, error) {
+	return func(ctx context.Context, _ map[string]any) (any, error) {
+		if check == nil {
+			return map[string]any{"status": "ok"}, nil
+		}
+		m, err := check(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if m == nil {
+			m = map[string]any{}
+		}
+		return m, nil
+	}
+}
+
+// muxGetSkillHandler returns the handler for <prefix>_get_skill.
+func muxGetSkillHandler(underlying *Registry, skillFn SkillBuilder) func(context.Context, map[string]any) (any, error) {
+	return func(ctx context.Context, _ map[string]any) (any, error) {
+		content := skillFn(underlying)
+		return map[string]any{"content": content}, nil
+	}
+}
+
