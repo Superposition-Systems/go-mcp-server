@@ -121,6 +121,8 @@ type ToolDef struct {
 
 `ListTools()` returns MCP tool definitions (including JSON Schema for arguments). `Call()` dispatches tool invocations by name. Return `isError: true` to signal a tool-level error to the client.
 
+For servers with more than a handful of tools, the [Registry](#extension-layer-v080) added in v0.8.0 is usually a nicer fit than implementing this interface directly — each tool is a self-describing struct with category, alias, and schema metadata, and `Registry.AsToolHandler()` produces the same interface.
+
 ## Configuration Options
 
 All options are passed to `New()`:
@@ -147,6 +149,11 @@ All options are passed to `New()`:
 | `WithTrustedProxyCIDRs(...)` | `nil` | CIDR ranges whose `X-Forwarded-For` / `X-Real-IP` the server may trust for rate-limiting keys. |
 | `WithAllowMissingState()` | `false` | Legacy opt-out — permits OAuth `/authorize` without the `state` parameter. Not recommended. |
 | `WithElevation(cfg)` | `nil` | Enables step-up-auth elevation (see [Elevation](#elevation)) |
+| `WithToolMiddleware(mw...)` | `nil` | Installs one or more tool-call middlewares; outermost-first (see [Extension layer](#extension-layer-v080)) |
+| `WithResponseTransformer(t)` | `nil` | Installs a tool-response transformer (e.g. `CompactREST()` for REST-envelope stripping) |
+| `WithParamAliases(global)` | `nil` | Rewrites parameter names before tool dispatch (e.g. `issueKey → issueKeyOrId`) |
+| `WithInputValidation(opts...)` | `nil` | Validates tool args against each `Tool.InputSchema` via JSON Schema 2020-12 |
+| `WithSuggestionHook(h)` | `nil` | Wires a `suggest.Hook` for fuzzy "did you mean?" telemetry from mux/aliases/validator |
 
 ### Environment Variables
 
@@ -288,6 +295,79 @@ For apps that want finer control than the bundled tools, the underlying primitiv
 - `auth.GrantStore` — in-memory TTL-keyed "is this key currently elevated" store
 - `auth.Elevation` — composes both with a configured TTL; provides `HasCurrentSession(ctx)`, `Elevate(ctx, password)`, etc.
 - `auth.TokenHash(token)`, `auth.GetTokenHash(ctx)` — stable per-session identity derived from the bearer token
+
+## Extension layer (v0.8.0)
+
+v0.8.0 added an opt-in composition surface for tool-handling concerns that used to live in consumer `switch` statements. Every feature below is additive — the existing `ToolHandler` interface is untouched, and consumers who don't install any of the new options see identical behaviour to v0.7.x.
+
+Full design: [`docs/plans/v0.8.0-middleware-and-registry.md`](docs/plans/v0.8.0-middleware-and-registry.md).
+
+### Registry: self-describing tool catalogue
+
+Alternative to hand-rolling `ToolHandler`. Define each tool once, including its metadata and handler; `registry.AsToolHandler()` satisfies the interface.
+
+```go
+reg := mcpserver.NewRegistry()
+reg.MustRegister(mcpserver.Tool{
+    Name:        "jiraGetIssue",
+    Description: "Fetch a Jira issue by key.",
+    Category:    "Issues",
+    InputSchema: json.RawMessage(`{"type":"object","properties":{"issueKeyOrId":{"type":"string"}},"required":["issueKeyOrId"]}`),
+    ParamAliases: map[string]string{"issueKey": "issueKeyOrId", "key": "issueKeyOrId"},
+    Handler: func(ctx context.Context, args map[string]any) (any, error) {
+        return jiraClient.GetIssue(ctx, args["issueKeyOrId"].(string))
+    },
+})
+srv.RegisterTools(reg.AsToolHandler())
+```
+
+### Mux: collapse many tools into 4
+
+`NewMux` wraps a Registry and exposes exactly four dispatcher tools: `<prefix>_execute`, `<prefix>_list_tools`, `<prefix>_health`, `<prefix>_get_skill`. The routing guide (`_get_skill`) is rendered from the Registry — parameter signatures come from each tool's `InputSchema`, no parallel metadata required. Matches the "150 tools → 4" pattern used by the Node atlassian-mcp server.
+
+```go
+mux := mcpserver.NewMux(reg, mcpserver.MuxConfig{
+    Prefix:  "atlassian",
+    Compact: true, // apply CompactREST to every successful result
+    Skill: mcpserver.DefaultSkillBuilder(mcpserver.SkillOptions{
+        Title:      "Atlassian MCP — Routing Guide",
+        Featured:   []mcpserver.Featured{{Section: "Issues", Tools: []string{"jiraGetIssue"}}},
+        Categorise: true,
+    }),
+})
+srv.RegisterTools(mux.AsToolHandler())
+```
+
+### Middleware chain and built-in transformers
+
+Every `tools/call` passes through a composable chain when any of the `With*` middleware options is set. Order (outer → inner): user middlewares → parameter aliases → schema validator → response transformer → registry dispatch. `initialize` / `tools/list` / `ping` bypass.
+
+```go
+srv := mcpserver.New(
+    mcpserver.WithName("my-mcp"),
+    mcpserver.WithResponseTransformer(mcpserver.CompactREST()),
+    mcpserver.WithParamAliases(map[string]string{"issueKey": "issueKeyOrId"}),
+    mcpserver.WithInputValidation(mcpserver.ValidationStrict()),
+    mcpserver.WithSuggestionHook(suggest.JSONLFile("/data/alias-suggestions.jsonl")),
+)
+```
+
+`CompactREST()` is a preset matching the Node atlassian-mcp strip keys (`avatarUrls`, `avatarUrl`, `iconUrl`, `expand` at any depth; URL-valued `self`; top-level `schema` and nulls). Custom transformers: `CompactResponse(StripFields("x"), StripNulls(), StripEmptyArrays())`.
+
+### Telemetry: fuzzy suggestions + alias collisions
+
+`WithSuggestionHook` wires one hook across the mux, the alias middleware, and the validator. Each unknown tool name, unknown parameter name, and alias collision produces a `suggest.Event` (Kind = `tool` / `param` / `alias_collision`). `suggest.JSONLFile(path)` is a ready-made sink; `suggest.Multi(h1, h2, ...)` fans out to many. Hook panics are recovered.
+
+### Subpackages
+
+| Subpackage | Purpose |
+|------------|---------|
+| [`suggest/`](suggest/) | Levenshtein `Closest`, typed `Event`/`Hook`, `JSONLFile`, `Multi`. Used by mux + aliases + validator. |
+| [`diag/`](diag/) | SQLite ring-buffer logger on its own DB file, `slog.Handler` adapter, tool-call `Middleware()`, auto-registered `server_get_logs` / `server_get_stats` tools. |
+| [`config/`](config/) | SQLite KV store with SQLite → file → env precedence, write-through, auto-registered `config_get` / `config_set` / `config_list` / `config_delete` tools. |
+| [`webhook/`](webhook/) | `HMACSHA256` and `BearerOrQuerySecret` verifiers plus a `Router` that attaches signature-verified endpoints to an existing `http.ServeMux`. Raw body buffered once (10 MB cap). |
+
+Runnable demos: [`example/mux_compact_example/`](example/mux_compact_example/) and [`example/diag_config_webhook_example/`](example/diag_config_webhook_example/).
 
 ## Security
 

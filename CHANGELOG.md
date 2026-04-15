@@ -5,6 +5,134 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.0] — 2026-04-15
+
+Composable extension layer: tool-call middleware chain, self-registering
+tool Registry, 4-tool Mux dispatcher, parameter aliases, JSON Schema input
+validator, fuzzy "did you mean?" suggester with telemetry hook, and three
+adjacent subpackages (`diag`, `config`, `webhook`). Every feature is
+opt-in via a new `With*` option. Zero breaking changes — the existing
+`ToolHandler` interface, `Server` shape, and OAuth/auth/elevation stack
+are all untouched.
+
+Built in four parallel sessions against a minimal-working Phase 0
+scaffold (see `docs/plans/v0.8.0-middleware-and-registry.md` for the
+full design and session allocation).
+
+### Added — core extension layer
+
+- **`Registry` + `Tool`** (`registry.go`) — a self-describing tool catalogue.
+  Implements `ToolHandler` via `AsToolHandler()`; alternative to hand-rolling
+  the interface. Stable-sorted `All()`, duplicate-name error on `Register`,
+  `MustRegister` panic variant, and a registration-after-`ListenAndServe`
+  guard. `Tool` carries `Name`, `Description`, `InputSchema`, `Category`,
+  `Tags`, per-tool `ParamAliases`, and the `Handler` func.
+- **Tool-call middleware chain** (`middleware.go`) — `ToolCallFunc` /
+  `ToolMiddleware` types plus `WithToolMiddleware(...)`. Chain applies
+  only to `tools/call`; `initialize` / `tools/list` / `ping` bypass. Error
+  semantics: `err != nil` is a library-level failure (short-circuits
+  downstream middleware), `isError: true` with `err == nil` is a
+  successful call reporting a tool-level error. Middleware order is
+  outermost-first (matches `net/http`).
+- **`Server.ToolCallChain()`** — exposes the fully-wrapped chain so custom
+  HTTP hosts and tests can drive it via `TransportHandlerWithMiddleware`
+  without bootstrapping `ListenAndServe`.
+- **`TransportHandlerWithMiddleware(info, tools, chain)`** — chain-aware
+  variant of `TransportHandler`. Passing `nil` falls back to the
+  pre-v0.8.0 direct-dispatch behaviour.
+
+### Added — composable features
+
+- **Response transformer** (`transformer.go`) — `WithResponseTransformer`
+  plus `CompactResponse`, `StripFields`, `StripNulls`, `StripEmptyArrays`,
+  and the `CompactREST()` preset (strips `avatarUrls`, `avatarUrl`,
+  `iconUrl`, `expand` at any depth; strips URL-valued `self`; strips
+  top-level `schema` and top-level nulls — mirrors the Node atlassian-mcp
+  compaction).
+- **4-tool Mux** (`mux.go`, `skill.go`) — `NewMux(reg, MuxConfig{...})`
+  wraps a registry and exposes exactly four dispatcher tools:
+  `<prefix>_execute`, `<prefix>_list_tools`, `<prefix>_health`,
+  `<prefix>_get_skill`. `<prefix>_execute` applies compaction (when
+  enabled), fires `EventUnknownTool` on miss with a fuzzy "did you mean?"
+  message, and rewrites parameter aliases on the inner payload.
+  `DefaultSkillBuilder(SkillOptions{...})` renders a markdown routing
+  guide with parameter signatures derived from each tool's
+  `InputSchema` top level — no parallel display metadata required.
+- **Parameter aliases** (`aliases.go`) — `WithParamAliases(global)` plus
+  per-tool `Tool.ParamAliases`. Rewrites `alias → canonical` when the
+  canonical property is declared on the tool's schema and absent from
+  the payload. Collisions (both present) drop the alias, preserve the
+  canonical, and fire `suggest.EventAliasCollision`. Library ships zero
+  default aliases — consumers declare their own.
+- **JSON Schema input validator** (`validator.go`) — `WithInputValidation`
+  with `ValidationStrict()` and `ValidationCoerce()` options. Short-
+  circuits with a library-level error on validation failure. Unknown
+  properties under strict mode fire `suggest.EventUnknownParam`.
+  Backed by `santhosh-tekuri/jsonschema/v6` (draft 2020-12; defaults
+  when `$schema` is missing).
+- **Suggestion telemetry** (`suggest/`) — `Closest` / `ClosestWithScores`
+  Levenshtein helpers; `Event` / `Hook` / `JSONLFile` / `Multi` sink.
+  `WithSuggestionHook(h)` wires one hook across the alias middleware,
+  the mux, and the validator. `JSONLFile(path)` returns a fire-and-
+  forget, mutex-serialised JSON-lines writer with a one-shot warning
+  on first filesystem error.
+- **Diagnostic logger** (`diag/`) — `diag.New(Config{...})` opens a
+  SQLite ring-buffer logger on its own file (separate from the auth DB
+  per §3.5 of the plan). Provides `Slog()`, a tool-call `Middleware()`,
+  and `RegisterTools()` registering `server_get_logs` and
+  `server_get_stats` (elevation-gated when `ElevationRequired`).
+  Categories match the Node atlassian-mcp set:
+  `request`/`tool`/`auth`/`api`/`lifecycle`/`error`.
+- **Config store** (`config/`) — `config.Open(Options{...})` opens a
+  SQLite KV store with precedence SQLite → credentials file → env.
+  Writes persist to SQLite and (when configured) to the credentials
+  file; env is backfilled on SQLite hit for downstream consumers that
+  read `os.Getenv`. `RegisterTools` adds `config_get` / `config_set` /
+  `config_list` / `config_delete`.
+- **Webhook router** (`webhook/`) — `NewRouter(mux).Handle(path, v, h)`
+  attaches signature-verified endpoints to an existing `http.ServeMux`.
+  Provides `HMACSHA256(secret, headerName)` (GitHub
+  `x-hub-signature-256` flow) and `BearerOrQuerySecret(secret, param)`
+  (Jira `?secret=` flow with double-encoding tolerance). Raw body is
+  buffered once (10 MB cap) so verifier and handler observe identical
+  bytes.
+
+### Added — examples + integration test
+
+- `example/mux_compact_example/` — Registry + Mux + CompactREST +
+  aliases + suggestion hook wired into one binary.
+- `example/diag_config_webhook_example/` — diag + config + webhook
+  wired onto one server.
+- `composition_test.go` — top-level six-point contract suite asserting
+  that all features compose correctly end-to-end (misspelled tool →
+  fuzzy error + JSONL; alias → canonical rewrite; alias collision →
+  event fired; `_get_skill` renders categories and signatures;
+  tool-level 404 yields `isError: true, err == nil`; webhook with bad
+  HMAC returns 401 before the handler runs).
+
+### Dependencies
+
+- Adds `github.com/santhosh-tekuri/jsonschema/v6` (pure-Go, one
+  transitive dep on `golang.org/x/text`). Only linked when a consumer
+  installs `WithInputValidation`.
+
+### Tests
+
+~3,000 lines of new test code spanning every new package and the
+composition suite. Density target matched the auth module's ~1 LOC
+test per 3 LOC production ratio. Every feature has happy-path + error-
+path + at least one "this is the bug you'd hit in production" edge-case
+assertion, plus the end-to-end composition suite.
+
+### Migration
+
+None required. The library remains source- and behaviour-compatible with
+v0.7.x consumers — `ToolHandler` is unchanged, `Server.New` takes the
+same options, existing `With*` options behave identically. Opt into new
+features one option at a time, in any order. Registry users can convert
+from a hand-rolled `ToolHandler` to `Registry` at their own pace; the
+two interoperate.
+
 ## [v0.7.5] — 2026-04-14
 
 Hotfix surfaced by the first real post-v0.7.4 deploy of vps-mcp:
