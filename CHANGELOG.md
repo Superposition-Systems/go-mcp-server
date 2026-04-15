@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.2] — 2026-04-16
+
+### Added
+
+- **Extended envelope alias set.** The mux's `<prefix>_execute` dispatcher
+  now tolerates four additional alias keys for the inner payload:
+  `payload` (the canonical choice in TypeScript MCP servers like
+  atlassian-mcp-server), `parameters` (the unabbreviated synonym of
+  `params`), `inputs` (plural typo safeguard for `input`), and `data`
+  (generic REST-style envelope). Canonical `args` still wins when
+  present; each alias fallback fires `suggest.EventEnvelopeAlias`.
+
+  Motivation: SPS has TypeScript-based MCP servers that chose `payload`
+  as their envelope key. Extending `go-mcp-server`'s alias tolerance to
+  cover that convention means Go-based servers accept call shapes written
+  for either library family — reducing cross-server inconsistency in the
+  fleet without requiring clients to remember per-server conventions.
+
 ## [v0.8.1] — 2026-04-15
 
 ### Fixed

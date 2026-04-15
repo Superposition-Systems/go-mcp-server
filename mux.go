@@ -217,17 +217,33 @@ func muxExecuteHandler(underlying *Registry, hook suggest.Hook, compact Response
 //
 // The canonical is "args" (see dispatchExecute in mux_test.go for the wire
 // shape). The aliases cover common drift observed in the wild:
-//   - "params" — used by claude.ai's MCP proxy and some JSON-RPC-style SDKs.
-//   - "arguments" — used by some early-MCP clients that mirrored function-
-//     call naming from the Anthropic API.
-//   - "input" — used by a handful of generic LLM-tool wrappers.
+//   - "params" — used by some JSON-RPC-style SDKs and proxy layers.
+//   - "arguments" — the literal MCP protocol name for tool-call args
+//     (tools/call carries {name, arguments}), sometimes passed through
+//     one layer too deep by clients.
+//   - "input" — used by a handful of generic LLM-tool wrappers and the
+//     Anthropic API's tool_use block.
+//   - "payload" — the canonical choice in TypeScript MCP servers (e.g.
+//     atlassian-mcp-server) and REST-style wrapper conventions.
+//   - "parameters" — the unabbreviated synonym of "params".
+//   - "inputs" — plural typo safeguard for "input".
+//   - "data" — generic REST-style envelope, occasionally used as
+//     the inner-payload key by hand-rolled clients.
 //
 // Accepting these does not change canonical behaviour: a payload with a
 // valid "args" map is always used, regardless of what else is present.
 // Only when "args" is absent or non-map do we fall back, and every
 // fallback fires an EventEnvelopeAlias telemetry event so operators can
 // see which clients are drifting from spec.
-var envelopeAliases = []string{"params", "arguments", "input"}
+var envelopeAliases = []string{
+	"params",
+	"arguments",
+	"input",
+	"payload",
+	"parameters",
+	"inputs",
+	"data",
+}
 
 // extractInnerArgs pulls the inner-payload map from the outer envelope,
 // tolerating alias keys for proxy clients that forward the wrong name.

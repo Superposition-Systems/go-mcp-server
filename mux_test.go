@@ -106,7 +106,7 @@ func TestMuxExecute_HappyPath(t *testing.T) {
 // map must reach the handler, and the suggestion hook must fire once with
 // Requested=alias, Suggested="args".
 func TestMuxExecute_EnvelopeAlias(t *testing.T) {
-	aliases := []string{"params", "arguments", "input"}
+	aliases := []string{"params", "arguments", "input", "payload", "parameters", "inputs", "data"}
 	for _, alias := range aliases {
 		t.Run(alias, func(t *testing.T) {
 			reg := mcp.NewRegistry()
