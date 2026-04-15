@@ -241,7 +241,9 @@ func (s *Server) ListenAndServe() error {
 	s.routeOnce.Do(func() {
 		s.mux.HandleFunc("GET /health", healthHandler)
 		s.mux.HandleFunc("GET /healthz", healthHandler)
-		s.mux.HandleFunc("POST "+s.mcpPath, TransportHandler(s.info, s.tools))
+		// v0.8.0 track 1B: route tools/call through the middleware chain.
+		// All other JSON-RPC methods bypass the chain per §5 of the plan.
+		s.mux.HandleFunc("POST "+s.mcpPath, TransportHandlerWithMiddleware(s.info, s.tools, buildToolCallChain(s)))
 		s.mux.HandleFunc("GET /.well-known/oauth-authorization-server", oauthHandler.Discovery)
 		s.mux.HandleFunc("GET /.well-known/oauth-protected-resource", oauthHandler.ProtectedResource)
 		s.mux.HandleFunc("POST /register", oauthHandler.Register)
