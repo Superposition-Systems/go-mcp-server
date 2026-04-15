@@ -54,6 +54,15 @@ func captureCall(t *testing.T) (ToolCallFunc, *map[string]any, *bool) {
 
 func mustRegister(t *testing.T, r *Registry, tool Tool) {
 	t.Helper()
+	// Track 1A's Registry requires a non-nil Handler. Validator tests don't
+	// exercise the handler path — they short-circuit in the validator
+	// middleware — so inject a trivial stub when callers haven't supplied
+	// one. Tests that explicitly want a custom handler still pass theirs.
+	if tool.Handler == nil {
+		tool.Handler = func(ctx context.Context, args map[string]any) (any, error) {
+			return map[string]any{"ok": true}, nil
+		}
+	}
 	if err := r.Register(tool); err != nil {
 		t.Fatalf("Register(%s): %v", tool.Name, err)
 	}
@@ -416,44 +425,11 @@ func TestValidator_Coerce_NumberToString(t *testing.T) {
 	}
 }
 
-func TestValidator_SchemaCacheKey_BustsOnReRegister(t *testing.T) {
-	reg := NewRegistry()
-	mustRegister(t, reg, Tool{
-		Name: "t",
-		InputSchema: raw(t, `{
-			"type":"object",
-			"properties":{"a":{"type":"string"}},
-			"required":["a"]
-		}`),
-	})
-	inner, _, _ := captureCall(t)
-	mw := buildValidationMiddleware(reg, nil, nil)
-	chain := mw(inner)
-
-	// First call valid under schema A.
-	if _, _, err := chain(context.Background(), "t", map[string]any{"a": "x"}); err != nil {
-		t.Fatalf("schema A valid call rejected: %v", err)
-	}
-
-	// Re-register the same name with schema B (requires "b", not "a").
-	mustRegister(t, reg, Tool{
-		Name: "t",
-		InputSchema: raw(t, `{
-			"type":"object",
-			"properties":{"b":{"type":"integer"}},
-			"required":["b"]
-		}`),
-	})
-
-	// Now {a:"x"} should be invalid (b is required, a is allowed by default
-	// since additionalProperties is unset). And {b:1} should be valid.
-	if _, _, err := chain(context.Background(), "t", map[string]any{"a": "x"}); err == nil {
-		t.Fatal("schema B should reject missing 'b'; cache may be serving stale schema A")
-	}
-	if _, _, err := chain(context.Background(), "t", map[string]any{"b": 1}); err != nil {
-		t.Fatalf("schema B valid call rejected: %v", err)
-	}
-}
+// TestValidator_SchemaCacheKey_BustsOnReRegister was removed after track 1A
+// landed: Registry.Register now rejects duplicate names, so the
+// re-registration scenario this test exercised is no longer reachable.
+// The validator's cache-by-name remains correct because names are unique
+// for the lifetime of a Registry — there is no invalidation path to test.
 
 func TestValidator_ErrorCategory(t *testing.T) {
 	// §3.3 contract: validation failures return err != nil — NOT isError=true.

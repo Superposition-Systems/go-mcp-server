@@ -145,9 +145,18 @@ func newCompositionFixture(t *testing.T) *compositionFixture {
 	})
 
 	// ── Mux: wraps the underlying registry as 4 dispatcher tools ────────
+	//
+	// SuggestionHook and GlobalParamAliases are also set here because the
+	// outer Server chain cannot descend into atlassian_execute's nested
+	// payload — unknown-tool + alias-collision events fire from inside the
+	// mux's execute handler. Sharing the same JSONLFile path across both
+	// sinks is intentional: every event of any kind lands in one file.
+	muxSuggestHook := suggest.JSONLFile(jsonlPath)
 	mux := mcp.NewMux(reg, mcp.MuxConfig{
-		Prefix:  "demo",
-		Compact: true,
+		Prefix:             "demo",
+		Compact:            true,
+		SuggestionHook:     muxSuggestHook,
+		GlobalParamAliases: map[string]string{"key": "issueKey"},
 		Skill: mcp.DefaultSkillBuilder(mcp.SkillOptions{
 			Title:      "Composition Test — Routing Guide",
 			Intro:      "Three tools across two categories.",
@@ -170,21 +179,17 @@ func newCompositionFixture(t *testing.T) *compositionFixture {
 
 	// ── HTTP scaffolding: serve MCP + webhooks from one ServeMux ───────
 	//
-	// We mount mcp.TransportHandler directly on srv.Mux() so each subtest
-	// can POST to /mcp without performing the bearer-auth dance that
-	// Server.ListenAndServe wires up. Track 1B is expected to wrap the
-	// registered ToolHandler with the configured middleware chain at
-	// transport build time; the wrapping is currently invisible from
-	// outside the package, so until 1B lands and (ideally) exposes an
-	// accessor, this scaffold mounts the same ToolHandler the Server
-	// would use and the chain is exercised through normal middleware
-	// composition once tracks 1B/3A/4A flip from identity to production.
+	// We mount TransportHandlerWithMiddleware with srv.ToolCallChain() so
+	// each subtest POSTs to /mcp and drives the full Server-level middleware
+	// chain (user middlewares → alias rewriter → validator → transformer →
+	// dispatch) without the bearer-auth / OAuth bootstrap that
+	// Server.ListenAndServe wires up.
 	httpMux := srv.Mux()
 	info := mcp.ServerInfo{
 		Name:    "composition-test",
 		Version: "0.0.0-test",
 	}
-	httpMux.HandleFunc("POST /mcp", mcp.TransportHandler(info, mux.AsToolHandler()))
+	httpMux.HandleFunc("POST /mcp", mcp.TransportHandlerWithMiddleware(info, mux.AsToolHandler(), srv.ToolCallChain()))
 
 	// ── Webhook: HMAC-protected route used by subtest (6) ──────────────
 	router := webhook.NewRouter(httpMux)
@@ -291,7 +296,6 @@ func TestComposition_SixPointContract(t *testing.T) {
 	// MCP transport at all. The five MCP-stack subtests follow.
 
 	t.Run("6_webhook_bad_hmac_returns_401_before_handler", func(t *testing.T) {
-		t.Skip("tightens after track 2D (webhook HMAC) merges — Phase 0 stub accepts every request")
 
 		fx := newCompositionFixture(t)
 		ts := httptest.NewServer(fx.mux)
@@ -322,7 +326,6 @@ func TestComposition_SixPointContract(t *testing.T) {
 	})
 
 	t.Run("1_misspelled_tool_emits_fuzzy_error_and_jsonl_line", func(t *testing.T) {
-		t.Skip("tightens after tracks 2A (real Closest + JSONLFile) and 3B (mux unknown-tool dispatch) merge")
 
 		fx := newCompositionFixture(t)
 		ts := httptest.NewServer(fx.mux)
@@ -357,7 +360,6 @@ func TestComposition_SixPointContract(t *testing.T) {
 	})
 
 	t.Run("2_alias_resolves_to_canonical_before_handler", func(t *testing.T) {
-		t.Skip("tightens after tracks 3A (alias middleware) and 1B (transport middleware wiring) merge")
 
 		fx := newCompositionFixture(t)
 		ts := httptest.NewServer(fx.mux)
@@ -381,7 +383,6 @@ func TestComposition_SixPointContract(t *testing.T) {
 	})
 
 	t.Run("3_alias_collision_drops_alias_and_writes_jsonl", func(t *testing.T) {
-		t.Skip("tightens after tracks 3A (alias middleware) + 2A (real JSONLFile) + 1B (middleware wiring) merge")
 
 		fx := newCompositionFixture(t)
 		ts := httptest.NewServer(fx.mux)
@@ -419,7 +420,6 @@ func TestComposition_SixPointContract(t *testing.T) {
 	})
 
 	t.Run("4_get_skill_renders_categories_and_signatures", func(t *testing.T) {
-		t.Skip("tightens after tracks 3B (DefaultSkillBuilder) and 2C (ExtractParams) merge")
 
 		fx := newCompositionFixture(t)
 		ts := httptest.NewServer(fx.mux)
@@ -445,7 +445,6 @@ func TestComposition_SixPointContract(t *testing.T) {
 	})
 
 	t.Run("5_tool_level_404_yields_isError_true_err_nil", func(t *testing.T) {
-		t.Skip("tightens after track 1B (transport middleware wiring + isError contract per §3.3) merges")
 
 		fx := newCompositionFixture(t)
 		ts := httptest.NewServer(fx.mux)

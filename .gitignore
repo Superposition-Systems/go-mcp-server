@@ -24,3 +24,11 @@ go.work.sum
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code worktrees (per-agent isolated clones)
+.claude/
+
+# Example binaries (built alongside source in their own subdirs)
+/example/example
+/example/mux_compact_example/mux_compact_example
+/example/diag_config_webhook_example/diag_config_webhook_example

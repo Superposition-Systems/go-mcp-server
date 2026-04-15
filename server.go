@@ -113,6 +113,24 @@ func (s *Server) RegisterTools(tools ToolHandler) {
 	s.tools = tools
 }
 
+// ToolCallChain returns the fully-wrapped tool-call chain for the Server's
+// currently-registered tools. The chain composes (outer → inner): user
+// middlewares (WithToolMiddleware), the parameter-alias rewriter
+// (WithParamAliases), the schema validator (WithInputValidation), the
+// response transformer (WithResponseTransformer), and finally the
+// registry dispatch.
+//
+// This is the same chain ListenAndServe installs on /mcp. Tests and
+// consumers that mount their own HTTP server can use it with
+// TransportHandlerWithMiddleware to drive the chain without the full
+// ListenAndServe bootstrap (which wires bearer auth, OAuth, etc.).
+//
+// Must be called after RegisterTools; returns a direct adapter over the
+// raw ToolHandler if no middleware is configured.
+func (s *Server) ToolCallChain() ToolCallFunc {
+	return buildToolCallChain(s)
+}
+
 // SetHealthCheck sets a custom health check handler. If not set, a default
 // handler returning 200 OK is used.
 func (s *Server) SetHealthCheck(handler http.HandlerFunc) {

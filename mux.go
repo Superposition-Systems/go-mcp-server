@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Superposition-Systems/go-mcp-server/internal/schema"
 	"github.com/Superposition-Systems/go-mcp-server/suggest"
 )
 
@@ -99,7 +100,7 @@ func NewMux(underlying *Registry, cfg MuxConfig) *Registry {
   },
   "required": ["tool"]
 }`),
-		Handler: muxExecuteHandler(underlying, cfg.SuggestionHook, compact),
+		Handler: muxExecuteHandler(underlying, cfg.SuggestionHook, compact, cfg.GlobalParamAliases),
 	})
 
 	out.MustRegister(Tool{
@@ -133,7 +134,13 @@ func NewMux(underlying *Registry, cfg MuxConfig) *Registry {
 }
 
 // muxExecuteHandler returns the handler for <prefix>_execute.
-func muxExecuteHandler(underlying *Registry, hook suggest.Hook, compact ResponseTransformer) func(context.Context, map[string]any) (any, error) {
+//
+// When globalAliases is non-empty or any looked-up tool has ParamAliases,
+// the handler rewrites the inner args map before dispatching — mirroring the
+// outer WithParamAliases middleware but applied to the nested payload the
+// mux sees. Per-tool aliases (Tool.ParamAliases) override global aliases;
+// collisions fire EventAliasCollision through hook. §4.4 + §4.10.
+func muxExecuteHandler(underlying *Registry, hook suggest.Hook, compact ResponseTransformer, globalAliases map[string]string) func(context.Context, map[string]any) (any, error) {
 	return func(ctx context.Context, args map[string]any) (any, error) {
 		name, _ := args["tool"].(string)
 		if name == "" {
@@ -171,6 +178,22 @@ func muxExecuteHandler(underlying *Registry, hook suggest.Hook, compact Response
 				return nil, fmt.Errorf("unknown tool %q", name)
 			}
 			return nil, fmt.Errorf("unknown tool %q — did you mean: %s?", name, strings.Join(suggestions, ", "))
+		}
+
+		// Apply parameter-alias rewriting to the inner payload before
+		// dispatching. Outer-chain alias middleware cannot reach nested
+		// args in atlassian_execute, so the mux performs the same rewrite
+		// locally using the same helpers (mergeAliasMaps +
+		// applyAliasRewrites) as §4.10's middleware.
+		if effective := mergeAliasMaps(globalAliases, t.ParamAliases); len(effective) > 0 && len(inner) > 0 {
+			params := schema.ExtractParams(t.InputSchema)
+			if len(params) > 0 {
+				canonicals := make(map[string]struct{}, len(params))
+				for _, p := range params {
+					canonicals[p.Name] = struct{}{}
+				}
+				inner = applyAliasRewrites(inner, effective, canonicals, name, hook)
+			}
 		}
 
 		result, err := t.Handler(ctx, inner)
