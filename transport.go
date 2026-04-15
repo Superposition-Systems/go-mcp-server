@@ -16,18 +16,35 @@ const protocolVersion = "2025-03-26"
 // This handler is router-agnostic — mount it on any router or stdlib ServeMux:
 //
 //	mux.HandleFunc("POST /mcp", mcpserver.TransportHandler(info, tools))
+//
+// This constructor installs no middleware; tools/call dispatches directly
+// to tools.Call. Consumers wanting middleware (v0.8.0+) should use
+// TransportHandlerWithMiddleware.
 func TransportHandler(info ServerInfo, tools ToolHandler) http.HandlerFunc {
+	return TransportHandlerWithMiddleware(info, tools, nil)
+}
+
+// TransportHandlerWithMiddleware is the chain-aware variant of
+// TransportHandler. The supplied ToolCallFunc is invoked for every
+// tools/call request; initialize, tools/list, ping, and notifications
+// bypass it per §5 of the v0.8.0 plan. If chain is nil, tools/call
+// falls back to adapting tools.Call directly — identical behaviour to
+// TransportHandler.
+func TransportHandlerWithMiddleware(info ServerInfo, tools ToolHandler, chain ToolCallFunc) http.HandlerFunc {
+	if chain == nil {
+		chain = adaptToolHandler(tools)
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", "POST")
 			http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
 			return
 		}
-		handlePost(w, r, info, tools)
+		handlePost(w, r, info, tools, chain)
 	}
 }
 
-func handlePost(w http.ResponseWriter, r *http.Request, info ServerInfo, tools ToolHandler) {
+func handlePost(w http.ResponseWriter, r *http.Request, info ServerInfo, tools ToolHandler, toolCall ToolCallFunc) {
 	accept := r.Header.Get("Accept")
 	if !strings.Contains(accept, "application/json") || !strings.Contains(accept, "text/event-stream") {
 		w.Header().Set("Content-Type", "application/json")
@@ -101,7 +118,7 @@ func handlePost(w http.ResponseWriter, r *http.Request, info ServerInfo, tools T
 	case "tools/list":
 		handleToolsList(w, req, tools)
 	case "tools/call":
-		handleToolsCall(w, r, req, tools)
+		handleToolsCall(w, r, req, toolCall)
 	default:
 		method := req.Method
 		if len(method) > 64 {
@@ -143,7 +160,20 @@ func handleToolsList(w http.ResponseWriter, req JSONRPCRequest, tools ToolHandle
 	})
 }
 
-func handleToolsCall(w http.ResponseWriter, r *http.Request, req JSONRPCRequest, tools ToolHandler) {
+// handleToolsCall dispatches tools/call through the supplied ToolCallFunc
+// (the middleware chain, per §5 of the v0.8.0 plan). The three-state
+// return (result, isError, err) collapses to the existing SSE/content
+// shape as follows:
+//
+//   - err != nil: library/middleware-level failure. Serialize the error
+//     text into the content array with isError=true (§3.3).
+//   - isError == true, err == nil: tool-level error. Serialize result
+//     as the tool's own error payload with isError=true.
+//   - both false/nil: success. Serialize result with isError=false.
+//
+// Marshal failures are folded into the err path so the wire shape is
+// always valid JSON.
+func handleToolsCall(w http.ResponseWriter, r *http.Request, req JSONRPCRequest, toolCall ToolCallFunc) {
 	var params struct {
 		Name      string         `json:"name"`
 		Arguments map[string]any `json:"arguments"`
@@ -157,11 +187,25 @@ func handleToolsCall(w http.ResponseWriter, r *http.Request, req JSONRPCRequest,
 		return
 	}
 
-	result, isError := tools.Call(r.Context(), params.Name, params.Arguments)
+	result, isError, callErr := toolCall(r.Context(), params.Name, params.Arguments)
 
-	text, marshalErr := marshalResult(result)
-	if marshalErr != nil {
+	// Library-level error (middleware short-circuit). Put the error text
+	// directly in the content array and force isError=true — this keeps
+	// the wire format identical to the tool-level error case, so clients
+	// don't have to distinguish. The ToolCallFunc contract (§3.3) says
+	// the caller should treat err as protocol-external; we fold it into
+	// the MCP isError envelope rather than a JSON-RPC error so the
+	// downstream client sees a tool failure, not a transport failure.
+	var text string
+	if callErr != nil {
 		isError = true
+		text = callErr.Error()
+	} else {
+		marshaled, marshalErr := marshalResult(result)
+		if marshalErr != nil {
+			isError = true
+		}
+		text = marshaled
 	}
 
 	content := []map[string]any{

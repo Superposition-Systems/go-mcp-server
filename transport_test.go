@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -343,6 +344,215 @@ func TestToolsCallInvalidParams(t *testing.T) {
 	}
 	if resp.Error.Code != -32602 {
 		t.Errorf("expected error code -32602, got %d", resp.Error.Code)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.8.0 track 1B — middleware chain wired into tools/call
+// ─────────────────────────────────────────────────────────────────────────────
+
+// newChainHandler builds a TransportHandlerWithMiddleware over a Registry so
+// the tests exercise the actual production wiring (not a hand-rolled chain).
+func newChainHandler(t *testing.T, reg *Registry, mws ...ToolMiddleware) http.HandlerFunc {
+	t.Helper()
+	info := ServerInfo{Name: "mw-test", Version: "1.0.0"}
+	tools := reg.AsToolHandler()
+	chain := applyMiddlewares(adaptToolHandler(tools), mws)
+	return TransportHandlerWithMiddleware(info, tools, chain)
+}
+
+// TestToolsCall_MiddlewareRunsAndMutatesResult proves a user-installed
+// ToolMiddleware can append to the result visible on the wire.
+func TestToolsCall_MiddlewareRunsAndMutatesResult(t *testing.T) {
+	reg := NewRegistry()
+	reg.MustRegister(Tool{
+		Name:        "echo",
+		Description: "echo",
+		Handler: func(_ context.Context, args map[string]any) (any, error) {
+			return map[string]any{"input": args["msg"]}, nil
+		},
+	})
+
+	marker := func(next ToolCallFunc) ToolCallFunc {
+		return func(ctx context.Context, n string, args map[string]any) (any, bool, error) {
+			r, ie, err := next(ctx, n, args)
+			if err == nil && !ie {
+				m, ok := r.(map[string]any)
+				if ok {
+					m["__mw_marker"] = true
+					r = m
+				}
+			}
+			return r, ie, err
+		}
+	}
+
+	handler := newChainHandler(t, reg, marker)
+	rec := doPost(handler, "tools/call", map[string]any{
+		"name":      "echo",
+		"arguments": map[string]any{"msg": "hi"},
+	})
+
+	resp := parseSSEResponse(t, rec.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected RPC error: %v", resp.Error)
+	}
+	result := resp.Result.(map[string]any)
+	if result["isError"] != false {
+		t.Errorf("expected isError=false, got %v", result["isError"])
+	}
+	content := result["content"].([]any)
+	first := content[0].(map[string]any)
+	if !strings.Contains(first["text"].(string), `"__mw_marker":true`) {
+		t.Fatalf("middleware marker missing from payload: %s", first["text"])
+	}
+	if !strings.Contains(first["text"].(string), `"input":"hi"`) {
+		t.Fatalf("original handler output missing: %s", first["text"])
+	}
+}
+
+// TestToolsCall_MiddlewareLibraryError proves a middleware returning
+// err != nil surfaces as isError=true with the error text in content
+// (§3.3 library-error shape).
+func TestToolsCall_MiddlewareLibraryError(t *testing.T) {
+	reg := NewRegistry()
+	reg.MustRegister(Tool{
+		Name: "x",
+		Handler: func(context.Context, map[string]any) (any, error) {
+			t.Fatal("handler must not run when middleware returns err")
+			return nil, nil
+		},
+	})
+	boom := errors.New("middleware boom")
+	shortCircuit := func(ToolCallFunc) ToolCallFunc {
+		return func(context.Context, string, map[string]any) (any, bool, error) {
+			return nil, false, boom
+		}
+	}
+
+	handler := newChainHandler(t, reg, shortCircuit)
+	rec := doPost(handler, "tools/call", map[string]any{
+		"name":      "x",
+		"arguments": map[string]any{},
+	})
+
+	resp := parseSSEResponse(t, rec.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("library errors must surface via MCP isError, not JSON-RPC error; got %v", resp.Error)
+	}
+	result := resp.Result.(map[string]any)
+	if result["isError"] != true {
+		t.Fatalf("expected isError=true for library err, got %v", result["isError"])
+	}
+	content := result["content"].([]any)
+	first := content[0].(map[string]any)
+	if !strings.Contains(first["text"].(string), "middleware boom") {
+		t.Fatalf("expected error text in content, got %q", first["text"])
+	}
+}
+
+// TestToolsCall_MiddlewareToolLevelError proves that isError=true with
+// err==nil is distinct from the library-error case — the handler runs
+// and its own payload is what ends up on the wire. Verifies §3.3.
+func TestToolsCall_MiddlewareToolLevelError(t *testing.T) {
+	reg := NewRegistry()
+	reg.MustRegister(Tool{
+		Name: "t",
+		Handler: func(context.Context, map[string]any) (any, error) {
+			// Simulates the adapter path: a tool reporting a tool-level
+			// failure with a structured payload.
+			return nil, errors.New("REMOTE 404: issue not found")
+		},
+	})
+	// Pure observer middleware — does NOT return err, just records.
+	observed := false
+	observer := func(next ToolCallFunc) ToolCallFunc {
+		return func(ctx context.Context, n string, args map[string]any) (any, bool, error) {
+			r, ie, err := next(ctx, n, args)
+			// Observer sees isError=true, err=nil — tool-level error.
+			if ie && err == nil {
+				observed = true
+			}
+			return r, ie, err
+		}
+	}
+
+	handler := newChainHandler(t, reg, observer)
+	rec := doPost(handler, "tools/call", map[string]any{
+		"name":      "t",
+		"arguments": map[string]any{},
+	})
+
+	resp := parseSSEResponse(t, rec.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected RPC error: %v", resp.Error)
+	}
+	result := resp.Result.(map[string]any)
+	if result["isError"] != true {
+		t.Errorf("expected isError=true, got %v", result["isError"])
+	}
+	content := result["content"].([]any)
+	first := content[0].(map[string]any)
+	// The handler's error path flows through registryHandler.Call as a
+	// tool-level isError with a structured content envelope — assert the
+	// error text reaches the wire.
+	if !strings.Contains(first["text"].(string), "REMOTE 404") {
+		t.Fatalf("expected tool-level error text on wire, got %q", first["text"])
+	}
+	if !observed {
+		t.Fatal("observer middleware did not see isError=true, err==nil — chain ordering wrong")
+	}
+}
+
+// TestToolsCall_BypassMethods_DoNotInvokeMiddleware wires a middleware
+// whose presence would be observable (a counter) and fires all the
+// non-tools/call methods through the transport. Per §5, the chain
+// only runs for tools/call.
+func TestToolsCall_BypassMethods_DoNotInvokeMiddleware(t *testing.T) {
+	reg := NewRegistry()
+	reg.MustRegister(Tool{
+		Name: "echo",
+		Handler: func(_ context.Context, args map[string]any) (any, error) {
+			return args, nil
+		},
+	})
+
+	var invocations int
+	// A panic-on-invoke counter is overkill because a panic becomes a
+	// test failure through the default recover; instead, we atomic-sum
+	// an int and assert it stays at zero after the bypass fires.
+	counter := func(next ToolCallFunc) ToolCallFunc {
+		return func(ctx context.Context, n string, args map[string]any) (any, bool, error) {
+			invocations++
+			return next(ctx, n, args)
+		}
+	}
+
+	handler := newChainHandler(t, reg, counter)
+
+	// initialize, tools/list, ping, and notifications/* all bypass the
+	// chain. Fire each and assert the counter stays at zero.
+	for _, method := range []string{"initialize", "tools/list", "ping", "notifications/initialized", "notifications/cancelled"} {
+		rec := doPost(handler, method, nil)
+		// notifications return 202, everything else returns 200 via SSE.
+		// We don't need to assert the body here — the existing tests
+		// already do that. We just need a round trip.
+		_ = rec
+	}
+	if invocations != 0 {
+		t.Fatalf("bypass methods invoked the middleware chain %d times; expected 0 (§5)", invocations)
+	}
+
+	// Sanity check: tools/call DOES invoke the chain.
+	rec := doPost(handler, "tools/call", map[string]any{
+		"name":      "echo",
+		"arguments": map[string]any{"a": 1},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tools/call failed: %d", rec.Code)
+	}
+	if invocations != 1 {
+		t.Fatalf("expected middleware to run exactly once for tools/call, got %d", invocations)
 	}
 }
 
