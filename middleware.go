@@ -95,7 +95,16 @@ func buildToolCallChain(s *Server) ToolCallFunc {
 		inner = inputValidationMiddleware(s.validationOptions)(inner)
 	}
 	if s.paramAliases != nil {
-		inner = paramAliasMiddleware(s.paramAliases)(inner)
+		// The alias middleware needs the *Registry to consult each tool's
+		// InputSchema for canonical-name membership. When the Server's
+		// ToolHandler is registry-backed (the common case via
+		// reg.AsToolHandler()), we unwrap it; otherwise the middleware
+		// degrades to identity per its nil-registry fast-path.
+		var reg *Registry
+		if h, ok := s.tools.(*registryHandler); ok {
+			reg = h.r
+		}
+		inner = newParamAliasMiddleware(s.paramAliases, reg, s.suggestionHook)(inner)
 	}
 
 	// User middlewares outermost, applied in the order passed to
