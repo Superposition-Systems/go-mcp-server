@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Superposition-Systems/go-mcp-server/auth"
+	"github.com/Superposition-Systems/go-mcp-server/suggest"
 )
 
 // Server is an opinionated MCP server that combines the JSON-RPC transport,
@@ -49,6 +50,15 @@ type Server struct {
 	elevationErr    error
 	elevation       *auth.Elevation
 	elevationPwd    *auth.PasswordStore
+
+	// v0.8.0 (optional) — tool-call middleware chain and associated knobs.
+	// Phase 0 holds the configuration; Session 2 (track 1B) wires the chain
+	// into transport.go's tools/call path.
+	toolMiddleware      []ToolMiddleware
+	responseTransformer ResponseTransformer
+	paramAliases        map[string]string
+	validationOptions   []ValidationOption
+	suggestionHook      suggest.Hook
 }
 
 // New creates a new MCP server with the given options.

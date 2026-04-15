@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Superposition-Systems/go-mcp-server/auth"
+	"github.com/Superposition-Systems/go-mcp-server/suggest"
 )
 
 // Option configures a Server.
@@ -195,4 +196,52 @@ func WithElevation(cfg ElevationConfig) Option {
 		c := cfg
 		s.elevationConfig = &c
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.8.0 options — tool-call middleware, registry extensions, telemetry.
+//
+// These options are declared here as the central "contract" file for the
+// Phase 0 scaffold. Session tracks implement the behaviour the options wire
+// into (middleware chain, transformer, aliases, validator, suggestion hook)
+// but do not re-declare the option signatures. See
+// docs/plans/v0.8.0-middleware-and-registry.md §8.1 + §8.3.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// WithToolMiddleware installs one or more ToolMiddleware wrappers. They run
+// outermost-first; the innermost wraps the registry's dispatch. Safe to call
+// multiple times — middlewares accumulate. See §4.2.
+func WithToolMiddleware(mw ...ToolMiddleware) Option {
+	return func(s *Server) { s.toolMiddleware = append(s.toolMiddleware, mw...) }
+}
+
+// WithResponseTransformer installs a transformer that runs on successful
+// tool-call results (isError=false, err=nil). Internally this is appended
+// as a tail-end ToolMiddleware. See §4.3.
+func WithResponseTransformer(t ResponseTransformer) Option {
+	return func(s *Server) { s.responseTransformer = t }
+}
+
+// WithParamAliases installs middleware that rewrites parameter names in the
+// args map before downstream middleware or the handler runs. Per-tool
+// aliases (Tool.ParamAliases) override the global map. Collisions (both
+// alias and canonical present) drop the alias and fire
+// suggest.EventAliasCollision. See §4.10.
+func WithParamAliases(global map[string]string) Option {
+	return func(s *Server) { s.paramAliases = global }
+}
+
+// WithInputValidation installs middleware that validates each tool's args
+// against its InputSchema before calling the handler. Tools without an
+// InputSchema pass through unchanged. See §4.6.
+func WithInputValidation(opts ...ValidationOption) Option {
+	return func(s *Server) { s.validationOptions = append(s.validationOptions, opts...) }
+}
+
+// WithSuggestionHook wires a suggest.Hook so that every unknown tool name
+// (mux dispatch), every unknown parameter name (validator / alias
+// middleware), and every alias collision produces a suggestion event. See
+// §4.11.
+func WithSuggestionHook(h suggest.Hook) Option {
+	return func(s *Server) { s.suggestionHook = h }
 }
