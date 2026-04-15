@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.1] — 2026-04-15
+
+### Fixed
+
+- **Mux dispatch accepts alias envelope keys.** The `<prefix>_execute`
+  dispatcher now tolerates `params`, `arguments`, and `input` as aliases
+  for the canonical `args` inner-payload key. Previously, a client that
+  sent `{"tool": "foo", "params": {...}}` would silently have its inner
+  map stripped — the handler would fire with an empty args map and any
+  required fields would trip "missing parameter" errors. The canonical
+  `args` key still wins when both are present; aliases fire a new
+  `suggest.EventEnvelopeAlias` telemetry event so operators can see
+  which clients/proxies drift from spec.
+
+  Motivation: the claude.ai MCP gateway was observed forwarding inner
+  payloads under `params`. Affected every SPS service behind that
+  gateway; this fix removes the dependency on an upstream proxy change.
+
+### Added
+
+- `suggest.EventEnvelopeAlias` event kind, fired by the mux dispatcher
+  when the inner payload arrived under an alias key. Fields: `Tool`
+  (the underlying tool targeted), `Requested` (the alias used),
+  `Suggested` (always `"args"`).
+
 ## [v0.8.0] — 2026-04-15
 
 Composable extension layer: tool-call middleware chain, self-registering

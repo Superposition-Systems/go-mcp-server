@@ -25,6 +25,13 @@ const (
 	// alias and the canonical name in the same payload; the alias is dropped
 	// and this event records the drop.
 	EventAliasCollision EventKind = "alias_collision"
+
+	// EventEnvelopeAlias fires when the mux's <prefix>_execute dispatcher
+	// received the inner payload under an alias key ("params", "arguments",
+	// "input") rather than the canonical "args". The dispatch succeeds; the
+	// event exists so operators can see which clients/proxies drift from
+	// spec and decide whether to push a fix upstream.
+	EventEnvelopeAlias EventKind = "envelope_alias"
 )
 
 // Event is fired once per unknown-name or alias-collision occurrence.
@@ -33,6 +40,9 @@ const (
 // For EventUnknownParam and EventAliasCollision, Tool is the parent tool.
 // For EventAliasCollision, Requested is the dropped alias and Suggested is
 // the canonical that won (never empty in this case).
+// For EventEnvelopeAlias, Tool is the underlying tool the envelope targeted
+// (from the outer "tool" field), Requested is the alias the client used,
+// and Suggested is always "args".
 type Event struct {
 	Kind      EventKind `json:"kind"`
 	Tool      string    `json:"tool,omitempty"`

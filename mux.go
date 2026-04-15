@@ -153,10 +153,7 @@ func muxExecuteHandler(underlying *Registry, hook suggest.Hook, compact Response
 		if name == "" {
 			return nil, fmt.Errorf("missing required argument \"tool\"")
 		}
-		inner, _ := args["args"].(map[string]any)
-		if inner == nil {
-			inner = map[string]any{}
-		}
+		inner := extractInnerArgs(args, name, hook)
 
 		t, ok := underlying.Lookup(name)
 		if !ok {
@@ -213,6 +210,52 @@ func muxExecuteHandler(underlying *Registry, hook suggest.Hook, compact Response
 		}
 		return result, nil
 	}
+}
+
+// envelopeAliases are the non-canonical top-level keys the mux accepts for
+// the inner payload in <prefix>_execute dispatch, in preference order.
+//
+// The canonical is "args" (see dispatchExecute in mux_test.go for the wire
+// shape). The aliases cover common drift observed in the wild:
+//   - "params" — used by claude.ai's MCP proxy and some JSON-RPC-style SDKs.
+//   - "arguments" — used by some early-MCP clients that mirrored function-
+//     call naming from the Anthropic API.
+//   - "input" — used by a handful of generic LLM-tool wrappers.
+//
+// Accepting these does not change canonical behaviour: a payload with a
+// valid "args" map is always used, regardless of what else is present.
+// Only when "args" is absent or non-map do we fall back, and every
+// fallback fires an EventEnvelopeAlias telemetry event so operators can
+// see which clients are drifting from spec.
+var envelopeAliases = []string{"params", "arguments", "input"}
+
+// extractInnerArgs pulls the inner-payload map from the outer envelope,
+// tolerating alias keys for proxy clients that forward the wrong name.
+// Always returns a non-nil map — the caller never has to nil-check.
+//
+// toolName is the value of outer["tool"], forwarded into the telemetry
+// event so operators can see which call site was affected.
+func extractInnerArgs(outer map[string]any, toolName string, hook suggest.Hook) map[string]any {
+	if m, ok := outer["args"].(map[string]any); ok {
+		return m
+	}
+	for _, alias := range envelopeAliases {
+		m, ok := outer[alias].(map[string]any)
+		if !ok {
+			continue
+		}
+		if hook != nil {
+			hook(suggest.Event{
+				Kind:      suggest.EventEnvelopeAlias,
+				Tool:      toolName,
+				Requested: alias,
+				Suggested: "args",
+				Timestamp: time.Now(),
+			})
+		}
+		return m
+	}
+	return map[string]any{}
 }
 
 // muxListToolsHandler returns the handler for <prefix>_list_tools.

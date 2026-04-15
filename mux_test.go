@@ -101,6 +101,109 @@ func TestMuxExecute_HappyPath(t *testing.T) {
 	}
 }
 
+// TestMuxExecute_EnvelopeAlias covers the claude.ai-style proxy that
+// forwards the inner payload under "params" instead of "args". The inner
+// map must reach the handler, and the suggestion hook must fire once with
+// Requested=alias, Suggested="args".
+func TestMuxExecute_EnvelopeAlias(t *testing.T) {
+	aliases := []string{"params", "arguments", "input"}
+	for _, alias := range aliases {
+		t.Run(alias, func(t *testing.T) {
+			reg := mcp.NewRegistry()
+			var gotArgs map[string]any
+			reg.MustRegister(mcp.Tool{
+				Name:        "foo",
+				InputSchema: json.RawMessage(`{"type":"object"}`),
+				Handler: func(ctx context.Context, args map[string]any) (any, error) {
+					gotArgs = args
+					return map[string]any{"ok": true}, nil
+				},
+			})
+
+			var (
+				mu     sync.Mutex
+				events []suggest.Event
+			)
+			hook := func(e suggest.Event) {
+				mu.Lock()
+				defer mu.Unlock()
+				events = append(events, e)
+			}
+
+			mux := mcp.NewMux(reg, mcp.MuxConfig{Prefix: "m", SuggestionHook: hook})
+			ex, ok := mux.Lookup("m_execute")
+			if !ok {
+				t.Fatal("m_execute not registered")
+			}
+			payload := map[string]any{
+				"tool": "foo",
+				alias:  map[string]any{"x": 1.0, "y": "two"},
+			}
+			_, err := ex.Handler(context.Background(), payload)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if gotArgs["x"] != 1.0 || gotArgs["y"] != "two" {
+				t.Fatalf("inner payload did not reach handler: got=%v", gotArgs)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			if len(events) != 1 {
+				t.Fatalf("expected 1 envelope-alias event, got %d: %#v", len(events), events)
+			}
+			e := events[0]
+			if e.Kind != suggest.EventEnvelopeAlias {
+				t.Errorf("event kind = %q, want %q", e.Kind, suggest.EventEnvelopeAlias)
+			}
+			if e.Tool != "foo" || e.Requested != alias || e.Suggested != "args" {
+				t.Errorf("unexpected event fields: %#v", e)
+			}
+		})
+	}
+}
+
+// TestMuxExecute_EnvelopeAlias_CanonicalWins verifies that when both "args"
+// and an alias are present, "args" is used and no telemetry fires. This is
+// the defence against a confused-deputy attack where a malicious client
+// layers an alias on top of a legitimate canonical payload.
+func TestMuxExecute_EnvelopeAlias_CanonicalWins(t *testing.T) {
+	reg := mcp.NewRegistry()
+	var gotArgs map[string]any
+	reg.MustRegister(mcp.Tool{
+		Name:        "foo",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		Handler: func(ctx context.Context, args map[string]any) (any, error) {
+			gotArgs = args
+			return nil, nil
+		},
+	})
+
+	var fired bool
+	hook := func(e suggest.Event) {
+		if e.Kind == suggest.EventEnvelopeAlias {
+			fired = true
+		}
+	}
+
+	mux := mcp.NewMux(reg, mcp.MuxConfig{Prefix: "m", SuggestionHook: hook})
+	ex, _ := mux.Lookup("m_execute")
+	payload := map[string]any{
+		"tool":   "foo",
+		"args":   map[string]any{"winner": "yes"},
+		"params": map[string]any{"winner": "no"},
+	}
+	if _, err := ex.Handler(context.Background(), payload); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotArgs["winner"] != "yes" {
+		t.Fatalf("args should win over params, got=%v", gotArgs)
+	}
+	if fired {
+		t.Error("envelope-alias event should not fire when canonical args is present")
+	}
+}
+
 func TestMuxExecute_UnknownTool(t *testing.T) {
 	reg := mcp.NewRegistry()
 	reg.MustRegister(fakeTool("foo", ""))
