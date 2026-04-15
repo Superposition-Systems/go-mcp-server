@@ -133,6 +133,125 @@ features one option at a time, in any order. Registry users can convert
 from a hand-rolled `ToolHandler` to `Registry` at their own pace; the
 two interoperate.
 
+### Fixed — post-merge sweep (same-day)
+
+Three security/bug sweeps after the v0.8.0 parallel-track merge found
+integration-seam defects where one track's output was consumed by
+another. All fixed before any consumer shipped against v0.8.0. Documented
+together because the underlying pattern ("wiring asserted, rejection
+not") is the same story.
+
+- **Input validation now actually runs.** `middleware.go` was wiring the
+  Phase-0 identity stub (`inputValidationMiddleware`) instead of the
+  production `buildValidationMiddleware`. Every consumer who added
+  `WithInputValidation(ValidationStrict())` was silently getting no
+  validation. Fixed by hoisting the `*Registry` unwrap and calling the
+  production builder directly. New `unwrapRegistry` helper walks both
+  `*registryHandler` and `*elevationTools`, so validation and alias
+  middleware now work under `WithElevation` too (previously a latent
+  identity-degrade).
+- **Registry seal now cascades through mux.** `NewMux` returns a fresh
+  registry that captures the underlying registry in handler closures.
+  Pre-fix, `ListenAndServe` sealed only the outer mux registry while
+  any consumer holding the underlying pointer could still `Register`
+  post-serve. `Registry` gained an unexported `parent *Registry` field;
+  `markStarted` walks the chain so sealing the outer registry seals
+  the underlying.
+- **`Server.ToolCallChain()` seals too.** Consumers mounting their own
+  HTTP host via `ToolCallChain()` + `TransportHandlerWithMiddleware` now
+  trigger the same seal as `ListenAndServe`, via a shared
+  `sync.Once`-gated `sealRegistry` helper on `Server`.
+- **JSON-RPC notification detection fixed.** `JSONRPCRequest.ID` is
+  `any` with `omitempty`, which collapses absent-id and explicit
+  `"id":null` to the same Go `nil`. The transport couldn't tell a
+  notification from a null-id request, so arbitrary notifications
+  fell through the method switch and received a response. Fixed with
+  a two-pass decode (first into a `json.RawMessage` envelope, then
+  into `JSONRPCRequest`); absent-id now 202s for any method, per
+  JSON-RPC 2.0 §4.1. The `notifications/initialized` /
+  `notifications/cancelled` whitelist is preserved for legacy lenient
+  clients that include an id.
+- **`config_set` credentials-file injection.** `config.Store.Set`
+  serialised `KEY=VALUE\n` with no escaping; a caller able to reach
+  `config_set` could embed `\n` in the value (or non-env characters
+  in the key) to inject additional rows into the credentials file and,
+  via the Open-time env mirror, the process environment on next
+  restart. `Set` and `Delete` now reject non-env-shaped keys; `Set`
+  rejects `\n`/`\r` in values.
+- **`diag.Logger.Close` race.** `Close` now takes `l.mu` and nil-clears
+  `l.db` inside the `closeOnce`, so the `l.db == nil` guards in
+  `write` / `handleGetLogs` / `handleGetStats` / `handleClearLogs`
+  (previously dead code) fire correctly after shutdown. Without this,
+  in-flight readers saw `sql.ErrConnDone` leak into tool errors on
+  shutdown interleavings.
+- **`suggest.JSONLFile` lifecycle + perms.** Holds one long-lived
+  `*os.File` for the process lifetime instead of opening and closing
+  it on every event (which serialised the request pipeline through
+  two syscalls per unknown-tool call under one mutex, amplifying any
+  flood). Perms tightened to `0700` dir / `0600` file, matching
+  `auth` / `config` / `diag`.
+- **Compaction recursion depth cap.** `CompactResponse` and
+  `CompactREST` now bail at 1000 levels via a threaded `depth int`
+  parameter. A self-referential tool result (buggy REST adapter) or a
+  pathologically nested payload no longer stack-overflows the server
+  — Go stack overflows are fatal, not recoverable, so the guard has
+  to sit at the recursion site rather than in a defer-recover.
+- **`Server.startedOnce`** (new). `sealRegistry` runs at most once
+  regardless of which entry point triggers it.
+- **`config.Store.handleList` propagates DB errors** instead of
+  silently returning an empty keys array when the SQLite query
+  fails. Private `listWithErr` companion preserves the public
+  `List() map[string]string` signature.
+- **`marshalResult` server-side log.** When tool-result marshalling
+  fails, the server now emits `log.Printf` in addition to the wire
+  `isError: true` envelope, so operators can distinguish a library
+  marshal bug from a legitimate tool-level error.
+- **`WithParamAliases(map[string]string{})`** no longer installs the
+  alias middleware — the guard changed from `!= nil` to `len(...) > 0`.
+  Empty map is now as cheap as nil.
+- **Validator stub docs.** `inputValidationMiddleware`'s godoc said
+  "Session 2 should call buildValidationMiddleware"; that work is done,
+  comment now reflects that the stub is retained only for the identity
+  regression test.
+
+New tests: `TestNewRegistry_MarkStartedCascadesToMuxUnderlying` pins
+the parent-chain seal, and `TestNotificationByAbsentID` exercises the
+§4.1 spec-compliance path. Both were missing end-to-end assertions
+that would have caught the original bugs.
+
+Fourth-pass sweep additions:
+
+- **Skill markdown injection blocked** (`skill.go`). `Tool.Name`,
+  `Tool.Description`, `Tool.Category`, and `Featured.Section` are now
+  passed through `sanitiseInline` before emission. Control chars
+  (including `\n` and `\r`) collapse to a single space so a tool
+  registered with `Name: "foo\n\n## Fake Header\n"` — plausible when
+  tool metadata is derived from an upstream 3rd-party API — can no
+  longer inject new markdown blocks into the `_get_skill` output.
+- **Fuzzy-suggester DoS surface closed** (`suggest/suggest.go`).
+  `ClosestWithScores` caps the query at 256 runes (real tool/param
+  names are sub-64) and adds a length-delta gate that skips the
+  Levenshtein DP whenever `abs(qLen - cLen)` already exceeds the
+  similarity threshold. Pre-fix, a caller could send a ~1 MB `tool`
+  string to the mux `_execute` handler and drive ~(1 MB × tool-count)
+  DP cell operations plus tens of MB of transient allocs per call.
+- **Skill render cached** (`mux.go:muxGetSkillHandler`). Registry is
+  sealed by `ToolCallChain` / `ListenAndServe`, so `DefaultSkillBuilder`
+  output is byte-identical across calls — `sync.Once` memoises it so
+  the ~300-alloc walk runs once per process, not per `_get_skill`
+  invocation.
+- **`JSONRPCRequest.ID` godoc** (`types.go`) now calls out the
+  absent-vs-null id distinction that the transport's two-pass decode
+  handles transparently, so any new handler reading `req.ID` directly
+  knows the limitation.
+
+Follow-on hardening flagged but deferred: schema-compile cache is
+unbounded (reachable only pre-seal; low risk); `ExtractParams` is
+re-parsed per dispatch in alias/skill paths (perf, not correctness);
+`io.ReadAll` body-buffer allocation is per-request (bounded by the
+10 MB cap); JSON-RPC `initialize` state machine is still not enforced
+(pre-existing).
+
 ## [v0.7.5] — 2026-04-14
 
 Hotfix surfaced by the first real post-v0.7.4 deploy of vps-mcp:

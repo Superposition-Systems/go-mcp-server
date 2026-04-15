@@ -40,6 +40,12 @@ type Registry struct {
 	mu      sync.Mutex
 	tools   map[string]Tool
 	started atomic.Bool
+	// parent, when non-nil, is another Registry that markStarted should
+	// also seal. Set by NewMux so sealing the mux-facing registry (the
+	// one bound to the Server) cascades to the underlying registry whose
+	// tools are captured in mux handler closures. Unexported — only
+	// library-internal constructors set this.
+	parent *Registry
 }
 
 // NewRegistry returns an empty Registry.
@@ -156,13 +162,18 @@ func (r *Registry) AsToolHandler() ToolHandler {
 // when the server transitions to the serving state, so that tool dispatch
 // during request handling never races with registration.
 //
+// When r has a parent (set by NewMux), markStarted walks the chain so
+// sealing a mux-facing registry also seals the underlying registry whose
+// tools the mux dispatches to. Without this, a caller holding the
+// underlying pointer could Register new tools after serving began —
+// violating the §2 "no runtime tool registration" non-goal.
+//
 // This method is unexported on purpose: only the Server (same package) may
-// flip the flag, and only as part of its start-up transition. Session 2 /
-// track 1B is responsible for actually invoking markStarted from
-// server.go / transport.go; track 1A ships the seam and its test coverage
-// so the invocation becomes a single-line change downstream.
+// flip the flag, and only as part of its start-up transition.
 func (r *Registry) markStarted() {
-	r.started.Store(true)
+	for cur := r; cur != nil; cur = cur.parent {
+		cur.started.Store(true)
+	}
 }
 
 // registryHandler is the internal ToolHandler adapter returned by

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Superposition-Systems/go-mcp-server/internal/schema"
@@ -76,6 +77,12 @@ func muxPrefix(cfg MuxConfig) string {
 func NewMux(underlying *Registry, cfg MuxConfig) *Registry {
 	prefix := muxPrefix(cfg)
 	out := NewRegistry()
+	// Chain the underlying registry so the Server's markStarted seal
+	// cascades to it. Without this the outer mux registry (bound to the
+	// Server) is sealed but the underlying — whose tools are captured in
+	// every mux handler closure — stays mutable, letting a caller
+	// register new tools against live dispatch.
+	out.parent = underlying
 
 	// Resolve skill builder once — consumers can override per MuxConfig.
 	skillFn := cfg.Skill
@@ -263,10 +270,24 @@ func muxHealthHandler(check func(context.Context) (map[string]any, error)) func(
 }
 
 // muxGetSkillHandler returns the handler for <prefix>_get_skill.
+//
+// Output is cached after the first call. The registry is sealed by
+// Server.ToolCallChain / ListenAndServe before dispatch begins, so
+// every subsequent render would produce byte-identical markdown —
+// DefaultSkillBuilder walks the registry, runs ExtractParams per tool,
+// and allocates a few hundred intermediate objects on every call,
+// which is pure waste under an LLM loop that polls _get_skill. One
+// sync.Once turns that into a one-shot cost.
 func muxGetSkillHandler(underlying *Registry, skillFn SkillBuilder) func(context.Context, map[string]any) (any, error) {
+	var (
+		once   sync.Once
+		cached string
+	)
 	return func(ctx context.Context, _ map[string]any) (any, error) {
-		content := skillFn(underlying)
-		return map[string]any{"content": content}, nil
+		once.Do(func() {
+			cached = skillFn(underlying)
+		})
+		return map[string]any{"content": cached}, nil
 	}
 }
 

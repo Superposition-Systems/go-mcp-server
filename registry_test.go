@@ -139,6 +139,30 @@ func TestRegistry(t *testing.T) {
 		r.MustRegister(Tool{Name: "third", Handler: okHandler(nil)})
 	})
 
+	t.Run("MarkStartedCascadesToMuxUnderlying", func(t *testing.T) {
+		// NewMux captures the underlying registry in handler closures, so
+		// sealing only the outer mux registry would leave the underlying
+		// mutable — and registration races with live dispatch would be
+		// possible via any caller who retained the underlying pointer.
+		// markStarted walks the parent chain to prevent this; this test
+		// pins that behaviour so a future refactor can't silently regress
+		// it (the bug class where wiring is asserted but rejection is
+		// not).
+		under := NewRegistry()
+		if err := under.Register(Tool{Name: "inner", Handler: okHandler(nil)}); err != nil {
+			t.Fatalf("under.Register: %v", err)
+		}
+		mux := NewMux(under, MuxConfig{Prefix: "x"})
+
+		mux.markStarted()
+
+		if err := under.Register(Tool{Name: "late", Handler: okHandler(nil)}); err == nil {
+			t.Fatal("under.Register after mux.markStarted returned nil, want 'started' error")
+		} else if !strings.Contains(err.Error(), "started") {
+			t.Errorf("error %q does not mention 'started'", err.Error())
+		}
+	})
+
 	t.Run("AsToolHandlerSuccess", func(t *testing.T) {
 		r := NewRegistry()
 		want := map[string]any{"content": []map[string]any{{"type": "text", "text": "ok"}}}

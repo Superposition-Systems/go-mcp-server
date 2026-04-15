@@ -300,7 +300,23 @@ For apps that want finer control than the bundled tools, the underlying primitiv
 
 v0.8.0 added an opt-in composition surface for tool-handling concerns that used to live in consumer `switch` statements. Every feature below is additive — the existing `ToolHandler` interface is untouched, and consumers who don't install any of the new options see identical behaviour to v0.7.x.
 
-Full design: [`docs/plans/v0.8.0-middleware-and-registry.md`](docs/plans/v0.8.0-middleware-and-registry.md).
+Design doc (frozen): [`docs/plans/v0.8.0-middleware-and-registry.md`](docs/plans/v0.8.0-middleware-and-registry.md). The doc locks the original design from the parallel-session delivery; behaviour guarantees below reflect the shipped code after the v0.8.0 sweep. When the two disagree, the code is authoritative.
+
+### Behaviour guarantees
+
+These invariants hold across every combination of `With*` options:
+
+- **Registry sealing.** The backing `*Registry` is sealed against further `Register` / `MustRegister` calls on the first call to either `Server.ListenAndServe()` or `Server.ToolCallChain()` (whichever comes first). When a mux wraps an underlying registry, sealing the mux cascades to the underlying — no path leaves a mutable registry captured in live dispatch closures.
+- **Error contract on the chain.** `err != nil` from any middleware is a library-level failure: the response transformer is skipped, and the wire envelope carries the error text with `isError: true`. `isError: true` with `err == nil` is a successful call reporting a tool-level error; transformers still skip it. A `marshalResult` failure on a successful tool result is logged server-side (`log.Printf`) in addition to being reported on the wire.
+- **Input validation.** `WithInputValidation` actually compiles each tool's `InputSchema` under draft 2020-12 and rejects on failure before the handler runs. `ValidationStrict()` rejects unknown top-level properties and fires `suggest.EventUnknownParam`. Validator wiring works under elevation-wrapped handlers too.
+- **Alias resolution.** `WithParamAliases(nil)` and `WithParamAliases(map[string]string{})` both skip installation of the alias middleware entirely — no per-call overhead when there's nothing to rewrite. Per-tool `Tool.ParamAliases` override the global map.
+- **JSON-RPC notifications.** Any request with no `id` field is treated as a notification: `202 Accepted` with an empty body, regardless of method. Historical `notifications/initialized` / `notifications/cancelled` are accepted even when a lenient client mistakenly sends an id.
+- **Compaction safety.** `CompactResponse` and `CompactREST` bail out at 1000 levels of recursion, so a buggy tool handler returning a self-referential or pathologically nested graph cannot stack-overflow the server.
+- **Config store.** `Set` and `Delete` reject keys that aren't env-var-shaped (`[A-Za-z0-9_]`, non-empty, non-leading-digit), and `Set` rejects values containing `\n`/`\r`. `config_list` propagates DB errors to the caller instead of returning an empty-keys response on failure.
+- **Telemetry sinks.** `suggest.JSONLFile` holds one long-lived file descriptor per process and drops back to re-opening only on write error; files are created `0600` under a `0700` parent.
+- **Diag logger shutdown.** `diag.Logger.Close` takes the write-lock and nil-clears the `*sql.DB` so in-flight readers/writers observe a consistent terminal state.
+
+Everything above is exercised by production code and tests; if you hit a counter-example, file it.
 
 ### Registry: self-describing tool catalogue
 

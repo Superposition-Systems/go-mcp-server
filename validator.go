@@ -42,17 +42,15 @@ func ValidationCoerce() ValidationOption {
 	return func(c *validationConfig) { c.coerce = true }
 }
 
-// inputValidationMiddleware preserves the Phase 0 signature so existing
-// wiring keeps compiling. The Phase 0 stub returned an identity middleware.
+// inputValidationMiddleware is the Phase 0 identity stub. Production
+// wiring uses buildValidationMiddleware (see middleware.go:buildToolCallChain),
+// which closes over the per-Server *Registry and suggest.Hook; this stub is
+// retained solely to keep TestValidator_Phase0EntrypointIsIdentity green —
+// the test fixes the library's contract that a middleware built without a
+// Registry degrades to identity rather than panicking.
 //
-// This continues to return an identity middleware: it has no Registry to
-// look schemas up in. Session 2 (track 1B) wires the chain into transport
-// and should call buildValidationMiddleware(reg, hook, opts) instead — that
-// function returns the production middleware closing over the per-Server
-// registry and suggestion hook. Both helpers are unexported; the public
-// surface is WithInputValidation/ValidationStrict/ValidationCoerce.
-//
-// Wired by track 1B.
+// The public surface is WithInputValidation / ValidationStrict /
+// ValidationCoerce; consumers never call this function directly.
 func inputValidationMiddleware(opts []ValidationOption) ToolMiddleware {
 	cfg := &validationConfig{}
 	for _, o := range opts {

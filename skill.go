@@ -106,9 +106,56 @@ func DefaultSkillBuilder(opts SkillOptions) SkillBuilder {
 	}
 }
 
+// sanitiseInline strips ASCII control characters (including newline,
+// carriage return, and tab) from a string destined for a single markdown
+// line, replacing each with a space. Prevents a tool registered with a
+// Name/Description/Category/Section containing "\n## Fake Header\n" from
+// injecting new markdown blocks into the rendered skill output.
+//
+// Markdown metacharacters (*, _, `, [, ]) are NOT escaped — a collision
+// there only affects the rendering of one line, not the document
+// structure. The structural attack is newlines; that's what we block.
+// A run of control chars collapses to a single space so the result
+// reads cleanly.
+func sanitiseInline(s string) string {
+	if s == "" {
+		return ""
+	}
+	hasCtrl := false
+	for _, r := range s {
+		if r < 0x20 || r == 0x7F {
+			hasCtrl = true
+			break
+		}
+	}
+	if !hasCtrl {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	prevSpace := false
+	for _, r := range s {
+		if r < 0x20 || r == 0x7F {
+			if !prevSpace {
+				b.WriteByte(' ')
+				prevSpace = true
+			}
+			continue
+		}
+		b.WriteRune(r)
+		prevSpace = false
+	}
+	return strings.TrimSpace(b.String())
+}
+
 // renderFeatured emits one Featured section. If every named tool is
 // absent from the registry, the entire section (header + body) is
 // skipped to avoid empty "##" headers.
+//
+// Tool Name, Description, and Featured.Section are passed through
+// sanitiseInline to block markdown-injection via control chars in
+// caller-registered strings. This matters for muxes of 3rd-party APIs
+// where tool metadata is derived from upstream names.
 func renderFeatured(b *strings.Builder, r *Registry, f Featured) {
 	present := make([]Tool, 0, len(f.Tools))
 	for _, name := range f.Tools {
@@ -123,17 +170,17 @@ func renderFeatured(b *strings.Builder, r *Registry, f Featured) {
 		return
 	}
 	b.WriteString("## ")
-	b.WriteString(f.Section)
+	b.WriteString(sanitiseInline(f.Section))
 	b.WriteString("\n\n")
 	for _, t := range present {
 		b.WriteString("- **")
-		b.WriteString(t.Name)
+		b.WriteString(sanitiseInline(t.Name))
 		b.WriteString("**(")
 		b.WriteString(renderSignature(t))
 		b.WriteString(")")
 		if t.Description != "" {
 			b.WriteString(" — ")
-			b.WriteString(t.Description)
+			b.WriteString(sanitiseInline(t.Description))
 		}
 		b.WriteString("\n")
 	}
@@ -190,7 +237,7 @@ func renderCategorised(b *strings.Builder, r *Registry) {
 	cats := r.Categories() // sorted dedup of non-empty categories
 	for _, c := range cats {
 		b.WriteString("### ")
-		b.WriteString(c)
+		b.WriteString(sanitiseInline(c))
 		b.WriteString("\n\n")
 		tools := byCategory[c]
 		// r.All() is sorted by name; filter above preserves that order,
@@ -199,10 +246,10 @@ func renderCategorised(b *strings.Builder, r *Registry) {
 		sort.Slice(tools, func(i, j int) bool { return tools[i].Name < tools[j].Name })
 		for _, t := range tools {
 			b.WriteString("- ")
-			b.WriteString(t.Name)
+			b.WriteString(sanitiseInline(t.Name))
 			if t.Description != "" {
 				b.WriteString(" — ")
-				b.WriteString(t.Description)
+				b.WriteString(sanitiseInline(t.Description))
 			}
 			b.WriteString("\n")
 		}
@@ -214,10 +261,10 @@ func renderCategorised(b *strings.Builder, r *Registry) {
 		sort.Slice(uncategorised, func(i, j int) bool { return uncategorised[i].Name < uncategorised[j].Name })
 		for _, t := range uncategorised {
 			b.WriteString("- ")
-			b.WriteString(t.Name)
+			b.WriteString(sanitiseInline(t.Name))
 			if t.Description != "" {
 				b.WriteString(" — ")
-				b.WriteString(t.Description)
+				b.WriteString(sanitiseInline(t.Description))
 			}
 			b.WriteString("\n")
 		}

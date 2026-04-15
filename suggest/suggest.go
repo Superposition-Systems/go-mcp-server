@@ -14,6 +14,15 @@ type Match struct {
 	Distance int
 }
 
+// maxQueryRunes caps the query length fed to the Levenshtein DP. Inputs
+// above this are almost certainly adversarial — real MCP tool and
+// parameter names are sub-64 runes. At the 1 MB params cap a caller could
+// otherwise drive ~(1 MB × avg-candidate-length) DP cell operations per
+// unknown-name call, turning the fuzzy suggester into a cheap DoS surface
+// (Closest runs on every unknown mux-execute tool name). 256 is
+// generous enough that any honest typo still matches.
+const maxQueryRunes = 256
+
 // Closest returns up to n candidates closest to query by Levenshtein
 // distance, filtered to a similarity threshold.
 //
@@ -35,6 +44,16 @@ func Closest(query string, candidates []string, n int) []string {
 }
 
 // ClosestWithScores is like Closest but returns (name, distance) pairs.
+//
+// DoS guards: queries longer than maxQueryRunes (256) return no matches
+// — they're either adversarial or a copy-paste mistake, and running the
+// DP on them makes this function a trivial CPU sink. For each candidate,
+// a length-delta gate skips the DP when |qLen - cLen| already exceeds
+// the similarity threshold (the minimum achievable distance is at least
+// the length delta, so no further work can improve it). Together these
+// bring the worst-case from O(Q·C·max(q,c)) cell operations to
+// O(C · max(q,c)) — the length-gate alone kills pathological inputs
+// even when q is pinned at 256.
 func ClosestWithScores(query string, candidates []string, n int) []Match {
 	if n <= 0 || query == "" || len(candidates) == 0 {
 		return nil
@@ -43,6 +62,9 @@ func ClosestWithScores(query string, candidates []string, n int) []Match {
 	qLower := strings.ToLower(query)
 	qRunes := []rune(qLower)
 	qLen := len(qRunes)
+	if qLen > maxQueryRunes {
+		return nil
+	}
 
 	matches := make([]Match, 0, len(candidates))
 	for _, c := range candidates {
@@ -58,6 +80,17 @@ func ClosestWithScores(query string, candidates []string, n int) []Match {
 		threshold := int(math.Ceil(float64(maxLen) * 0.4))
 		if threshold < 3 {
 			threshold = 3
+		}
+
+		// Length-gate: the edit distance is always at least the
+		// absolute length difference. If that already exceeds the
+		// threshold, the DP cannot produce a qualifying match.
+		delta := qLen - cLen
+		if delta < 0 {
+			delta = -delta
+		}
+		if delta > threshold {
+			continue
 		}
 
 		d := levenshteinRunes(qRunes, cRunes)

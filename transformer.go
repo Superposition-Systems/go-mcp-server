@@ -74,9 +74,18 @@ func CompactResponse(opts ...CompactOption) ResponseTransformer {
 		return func(_ string, result any) any { return result }
 	}
 	return func(_ string, result any) any {
-		return compactWalk(result, cfg, true)
+		return compactWalk(result, cfg, true, 0)
 	}
 }
+
+// maxCompactDepth caps compaction recursion so a tool handler that
+// returns a self-referential map[string]any (buggy REST adapter) or a
+// pathologically nested JSON graph cannot stack-overflow the server.
+// Go stack overflows are fatal, not recoverable, so the guard has to sit
+// at the recursion points rather than in a defer-recover. 1000 levels
+// vastly exceeds any legitimate REST payload — Jira's deepest issue
+// graph is ~8.
+const maxCompactDepth = 1000
 
 // CompactREST is a preset matching the Node reference implementation at
 // mux-tools.mjs:178-214. It applies these strips:
@@ -105,7 +114,7 @@ func CompactREST() ResponseTransformer {
 		"expand":     {},
 	}
 	return func(_ string, result any) any {
-		return compactRESTWalk(result, stripKeys, true)
+		return compactRESTWalk(result, stripKeys, true, 0)
 	}
 }
 
@@ -113,18 +122,21 @@ func CompactREST() ResponseTransformer {
 // outermost invocation; nested calls pass false. The current implementation
 // applies every configured strip at every depth (no top-level-only rules),
 // so `root` is accepted for future-proofing and ignored here.
-func compactWalk(v any, cfg *compactConfig, _ bool) any {
+func compactWalk(v any, cfg *compactConfig, _ bool, depth int) any {
+	if depth > maxCompactDepth {
+		return v
+	}
 	switch m := v.(type) {
 	case map[string]any:
-		return compactMap(m, cfg)
+		return compactMap(m, cfg, depth+1)
 	case []any:
-		return compactSlice(m, cfg)
+		return compactSlice(m, cfg, depth+1)
 	case []map[string]any:
 		// Walk each element; rebuild only if any element changes.
 		out := make([]map[string]any, len(m))
 		changed := false
 		for i, e := range m {
-			w := compactMap(e, cfg)
+			w := compactMap(e, cfg, depth+1)
 			if wm, ok := w.(map[string]any); ok {
 				// compactMap may return the same map unchanged, or a fresh one.
 				if !changed && !sameMap(e, wm) {
@@ -151,7 +163,7 @@ func compactWalk(v any, cfg *compactConfig, _ bool) any {
 		if err := json.Unmarshal(m, &decoded); err != nil {
 			return m
 		}
-		walked := compactWalk(decoded, cfg, false)
+		walked := compactWalk(decoded, cfg, false, depth+1)
 		enc, err := json.Marshal(walked)
 		if err != nil {
 			return m
@@ -165,7 +177,7 @@ func compactWalk(v any, cfg *compactConfig, _ bool) any {
 // compactMap walks a map[string]any. Returns the input map unchanged (same
 // pointer) if no entries were stripped or rewritten; otherwise returns a
 // fresh map.
-func compactMap(m map[string]any, cfg *compactConfig) any {
+func compactMap(m map[string]any, cfg *compactConfig, depth int) any {
 	// First pass: determine whether we need to rebuild. If any key must be
 	// dropped, or any child value changes identity, rebuild.
 	var out map[string]any
@@ -197,7 +209,7 @@ func compactMap(m map[string]any, cfg *compactConfig) any {
 			continue
 		}
 		// Recurse into nested containers.
-		nv := compactWalk(v, cfg, false)
+		nv := compactWalk(v, cfg, false, depth+1)
 		if !sameValue(v, nv) {
 			ensureOut()
 			out[k] = nv
@@ -210,10 +222,10 @@ func compactMap(m map[string]any, cfg *compactConfig) any {
 }
 
 // compactSlice walks a []any.
-func compactSlice(s []any, cfg *compactConfig) any {
+func compactSlice(s []any, cfg *compactConfig, depth int) any {
 	var out []any
 	for i, e := range s {
-		ne := compactWalk(e, cfg, false)
+		ne := compactWalk(e, cfg, false, depth+1)
 		if !sameValue(e, ne) {
 			if out == nil {
 				out = make([]any, len(s))
@@ -230,14 +242,17 @@ func compactSlice(s []any, cfg *compactConfig) any {
 
 // compactRESTWalk implements the CompactREST semantics. `root` true signals
 // that the extra top-level-only rules (strip `schema`, strip nulls) apply.
-func compactRESTWalk(v any, stripKeys map[string]struct{}, root bool) any {
+func compactRESTWalk(v any, stripKeys map[string]struct{}, root bool, depth int) any {
+	if depth > maxCompactDepth {
+		return v
+	}
 	switch m := v.(type) {
 	case map[string]any:
-		return compactRESTMap(m, stripKeys, root)
+		return compactRESTMap(m, stripKeys, root, depth+1)
 	case []any:
 		var out []any
 		for i, e := range m {
-			ne := compactRESTWalk(e, stripKeys, false)
+			ne := compactRESTWalk(e, stripKeys, false, depth+1)
 			if !sameValue(e, ne) {
 				if out == nil {
 					out = make([]any, len(m))
@@ -254,7 +269,7 @@ func compactRESTWalk(v any, stripKeys map[string]struct{}, root bool) any {
 		out := make([]map[string]any, len(m))
 		changed := false
 		for i, e := range m {
-			w := compactRESTMap(e, stripKeys, false)
+			w := compactRESTMap(e, stripKeys, false, depth+1)
 			if wm, ok := w.(map[string]any); ok {
 				if !changed && !sameMap(e, wm) {
 					changed = true
@@ -277,7 +292,7 @@ func compactRESTWalk(v any, stripKeys map[string]struct{}, root bool) any {
 		if err := json.Unmarshal(m, &decoded); err != nil {
 			return m
 		}
-		walked := compactRESTWalk(decoded, stripKeys, root)
+		walked := compactRESTWalk(decoded, stripKeys, root, depth+1)
 		enc, err := json.Marshal(walked)
 		if err != nil {
 			return m
@@ -288,7 +303,7 @@ func compactRESTWalk(v any, stripKeys map[string]struct{}, root bool) any {
 	}
 }
 
-func compactRESTMap(m map[string]any, stripKeys map[string]struct{}, root bool) any {
+func compactRESTMap(m map[string]any, stripKeys map[string]struct{}, root bool, depth int) any {
 	var out map[string]any
 	ensureOut := func() {
 		if out == nil {
@@ -319,7 +334,7 @@ func compactRESTMap(m map[string]any, stripKeys map[string]struct{}, root bool) 
 			delete(out, k)
 			continue
 		}
-		nv := compactRESTWalk(v, stripKeys, false)
+		nv := compactRESTWalk(v, stripKeys, false, depth+1)
 		if !sameValue(v, nv) {
 			ensureOut()
 			out[k] = nv

@@ -52,12 +52,19 @@ type Hook func(Event)
 // log.Printf warning on the first failure — telemetry must never break
 // request flow.
 //
+// The file descriptor is opened lazily on the first event and held for
+// the process lifetime. A per-event open+close would serialise the
+// request pipeline through a pair of syscalls under the mutex, giving
+// an adversarial unknown-tool flood a trivial DoS amplification vector.
+// On a transient open failure the hook keeps trying on subsequent events
+// (one line of warn-log is still suppressed by warnOnce).
+//
 // If Event.Timestamp is zero at write time, time.Now() is stamped in.
 func JSONLFile(path string) Hook {
 	var (
-		mu          sync.Mutex
-		dirReady    bool
-		warnOnce    sync.Once
+		mu       sync.Mutex
+		f        *os.File
+		warnOnce sync.Once
 	)
 	warn := func(err error) {
 		warnOnce.Do(func() {
@@ -78,26 +85,30 @@ func JSONLFile(path string) Hook {
 		mu.Lock()
 		defer mu.Unlock()
 
-		if !dirReady {
-			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if f == nil {
+			// 0700/0600 matches the auth/config/diag convention: telemetry
+			// events are not secret but may include raw unknown-tool /
+			// unknown-param names that reflect caller-supplied strings, and
+			// uniform tight perms avoid "one of these sinks is the leak"
+			// diagnostic surprises later.
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 				warn(err)
 				return
 			}
-			dirReady = true
+			opened, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+			if err != nil {
+				warn(err)
+				return
+			}
+			f = opened
 		}
 
-		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-		if err != nil {
-			warn(err)
-			return
-		}
 		if _, err := f.Write(buf); err != nil {
 			warn(err)
+			// Drop the handle so a transient failure (e.g. file rotated
+			// or volume remounted) does not poison every future write.
 			_ = f.Close()
-			return
-		}
-		if err := f.Close(); err != nil {
-			warn(err)
+			f = nil
 		}
 	}
 }

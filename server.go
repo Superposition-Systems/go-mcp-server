@@ -39,6 +39,7 @@ type Server struct {
 	healthFunc      http.HandlerFunc
 	oauthDBPath     string
 	routeOnce       sync.Once
+	startedOnce     sync.Once // seals the backing *Registry on first use
 	outerMiddleware func(http.Handler) http.Handler // applied outside bearer auth
 	allowedOrigins  []string                        // CORS allowlist (optional)
 
@@ -127,8 +128,23 @@ func (s *Server) RegisterTools(tools ToolHandler) {
 //
 // Must be called after RegisterTools; returns a direct adapter over the
 // raw ToolHandler if no middleware is configured.
+//
+// ToolCallChain seals the backing Registry against further Register calls
+// (exactly once across the Server's lifetime — ListenAndServe also seals
+// via the same sync.Once so both entry points enforce the §2 "no runtime
+// tool registration" invariant).
 func (s *Server) ToolCallChain() ToolCallFunc {
+	s.startedOnce.Do(s.sealRegistry)
 	return buildToolCallChain(s)
+}
+
+// sealRegistry calls markStarted on the backing *Registry, if the
+// ToolHandler is registry-backed. No-op otherwise. Drives the sync.Once
+// wired from both ToolCallChain and ListenAndServe.
+func (s *Server) sealRegistry() {
+	if reg := unwrapRegistry(s.tools); reg != nil {
+		reg.markStarted()
+	}
 }
 
 // SetHealthCheck sets a custom health check handler. If not set, a default
@@ -197,6 +213,16 @@ func (s *Server) ListenAndServe() error {
 		// Wrap the user's tool handler to add library-level elevation tools.
 		s.tools = s.wrapToolsWithElevation(s.tools)
 	}
+
+	// Seal the registry against further Register calls. From this point on
+	// tool dispatch is live and registration mutations would race with
+	// middleware that captures registry-derived state (validator schema
+	// cache, alias canonical-set, skill renderer). Gated by startedOnce so
+	// a consumer who already called ToolCallChain (custom HTTP host path)
+	// does not re-seal; both entry points converge on the same invariant.
+	// See registry.go:markStarted + §2 non-goals ("No runtime tool
+	// registration").
+	s.startedOnce.Do(s.sealRegistry)
 
 	// OAuth store
 	oauthStore, err := auth.NewOAuthStore(s.oauthDBPath, s.oauthConfig.Scope)

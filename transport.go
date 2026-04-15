@@ -1,8 +1,10 @@
 package mcpserver
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -76,8 +78,14 @@ func handlePost(w http.ResponseWriter, r *http.Request, info ServerInfo, tools T
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10 MB
-	var req JSONRPCRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// Buffer the body so we can decode twice: once into a raw-id envelope
+	// for notification detection (§JSON-RPC 2.0 §4.1: absent id means
+	// notification, server MUST NOT reply), then into JSONRPCRequest for
+	// the existing dispatch flow. A single-pass decode can't distinguish
+	// absent id from explicit null id once it lands in an `any` field —
+	// both become Go nil.
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
 		writeSSE(w, JSONRPCResponse{
 			JSONRPC: "2.0",
 			ID:      nil,
@@ -85,10 +93,36 @@ func handlePost(w http.ResponseWriter, r *http.Request, info ServerInfo, tools T
 		})
 		return
 	}
-	// JSON-RPC 2.0 §4.2: id MUST be a string, number, or null. We also
-	// cap string ids at 256 bytes so we do not echo arbitrarily large
-	// attacker-controlled content in every response.
-	if !validRPCID(req.ID) {
+	var envelope struct {
+		ID json.RawMessage `json:"id,omitempty"`
+	}
+	// envelopeOK distinguishes "parsed, id absent" (true notification)
+	// from "body is malformed JSON" (treat as a best-effort request so
+	// the caller still gets a -32700 Parse error SSE response).
+	envelopeOK := json.Unmarshal(bodyBytes, &envelope) == nil
+	isNotification := envelopeOK && len(envelope.ID) == 0
+
+	var req JSONRPCRequest
+	if err := json.NewDecoder(bytes.NewReader(bodyBytes)).Decode(&req); err != nil {
+		if isNotification {
+			// Malformed notification: per JSON-RPC §4.1 the server still
+			// sends no response. This branch is effectively unreachable
+			// because envelopeOK implies the body is valid JSON, which
+			// the full decode would also accept — but covered for safety.
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		writeSSE(w, JSONRPCResponse{
+			JSONRPC: "2.0",
+			ID:      nil,
+			Error:   &RPCError{Code: -32700, Message: "Parse error"},
+		})
+		return
+	}
+	// JSON-RPC 2.0 §4.2: id MUST be a string, number, or null. Skip for
+	// notifications (id absent) — the spec permits any shape there
+	// because the server produces no reply.
+	if !isNotification && !validRPCID(req.ID) {
 		writeSSE(w, JSONRPCResponse{
 			JSONRPC: "2.0",
 			ID:      nil,
@@ -100,11 +134,29 @@ func handlePost(w http.ResponseWriter, r *http.Request, info ServerInfo, tools T
 	// more than that, and the decoded object graph can be substantially
 	// larger than the encoded byte count.
 	if len(req.Params) > 1<<20 {
+		if isNotification {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 		writeSSE(w, JSONRPCResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
 			Error:   &RPCError{Code: -32600, Message: "Invalid Request: params too large"},
 		})
+		return
+	}
+
+	// A request with no id is a notification for ANY method — the server
+	// MUST NOT reply (JSON-RPC §4.1). Return 202 and drop on the floor.
+	//
+	// The `notifications/initialized` / `notifications/cancelled` cases
+	// are ALSO treated as 202 even when a client mistakenly includes an
+	// id, because MCP clients in the wild occasionally do this and the
+	// library has historically been lenient there. That lenient handling
+	// is preserved as a compat pragma; true spec compliance only kicks in
+	// for non-notification-named methods via isNotification above.
+	if isNotification {
+		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 
@@ -203,6 +255,12 @@ func handleToolsCall(w http.ResponseWriter, r *http.Request, req JSONRPCRequest,
 	} else {
 		marshaled, marshalErr := marshalResult(result)
 		if marshalErr != nil {
+			// Log server-side: on the wire this is indistinguishable from a
+			// tool-level error (both isError=true), so without this line an
+			// operator cannot tell a marshal bug from a genuine failing tool
+			// — callErr != nil is a tool-level error, marshalErr != nil is a
+			// library-level serialisation bug that deserves an alert.
+			log.Printf("mcpserver: marshal tool %q result: %v", params.Name, marshalErr)
 			isError = true
 		}
 		text = marshaled

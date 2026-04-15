@@ -281,3 +281,27 @@ _2026-04-15 10:48_
 `★ Insight ─────────────────────────────────────`
 Every integration issue was at a *hand-off boundary* between sessions — signature changes, semantic assumptions (duplicate registration allowed?), and a layering question (outer chain vs. mux-internal dispatch). The minimal-working Phase 0 approach caught zero of these at compile time because each session's changes compiled against its own local expectations. This is where a post-merge integration pass earns its keep — the phased plan assumed this work would exist, it just lives here rather than inside any single session.
 `─────────────────────────────────────────────────`
+---
+_2026-04-15 11:06_
+
+`★ Insight ─────────────────────────────────────`
+C-1 is a classic "track-handoff" bug: the v0.8.0 work was split across parallel tracks (1A/1B/2A–F/3A/3B/4A/4B), and the validator's own comment anticipated this exact wiring step. Parallel merges are fast but the integration seam — "who actually calls `buildValidationMiddleware`?" — was nobody's track. The six-point composition_test.go was supposed to catch this but asserts wiring, not rejection, so the stub slipped through green tests.
+`─────────────────────────────────────────────────`
+---
+_2026-04-15 11:49_
+
+`★ Insight ─────────────────────────────────────`
+The M-C fix is worth a second look from a design angle: Go's stack overflow is a *fatal* runtime error, not a recoverable panic, so the idiomatic "defer recover()" guard you might reach for from Node/Python muscle memory does nothing here. The only way to avoid it is to count at the recursion site itself. This is a recurring gotcha for teams coming from stacks with unlimited or recoverable stacks — worth knowing before you hit the crash in production.
+`─────────────────────────────────────────────────`
+---
+_2026-04-15 12:04_
+
+`★ Insight ─────────────────────────────────────`
+C (the notification fix) is a great illustration of why "spec compliance" and "client compat" sometimes pull in different directions. The right spec fix is "absent id = no reply, always." But MCP clients in the wild send `notifications/initialized` with an id because the method name has "notifications/" in it and they assume that's enough. Keeping the whitelist as a compat pragma alongside the correct §4.1 rule gives you both: strict spec behaviour for new clients, graceful tolerance for legacy ones. The comment at that site flags it as a pragma so future maintainers don't silently "clean up" the whitelist and break real clients.
+`─────────────────────────────────────────────────`
+---
+_2026-04-15 12:27_
+
+`★ Insight ─────────────────────────────────────`
+The skill.go sanitiser is worth a note on *threat model surface shift*. The library's original trust model was "registered tools are trusted code" — which is true when you hand-write `reg.Register(...)`. But the moment a consumer wires a mux around a 3rd-party API whose tool names come from that API (GitHub's GraphQL schema, Atlassian's REST catalogue), tool metadata is no longer fully consumer-controlled. The sanitiser moves the library's trust boundary from "all registered strings are safe" to "all registered strings are rendered safely." Small scope change, meaningful blast-radius reduction.
+`─────────────────────────────────────────────────`

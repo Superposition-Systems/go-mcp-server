@@ -39,6 +39,14 @@ type ServerInfo struct {
 // JSON-RPC 2.0 types used by the transport layer.
 
 // JSONRPCRequest represents an incoming JSON-RPC 2.0 request.
+//
+// ID note: an `any`-typed ID cannot distinguish an absent id (notification,
+// per §4.1 — server MUST NOT reply) from an explicit `"id":null` (request
+// that wants a response with a null id). Both decode to Go nil. The
+// transport compensates via a two-pass decode on the raw bytes before
+// dispatch; downstream handlers that need the same distinction must do
+// the same (or read the spec and treat null-id requests as valid
+// requests, not notifications — which is what the transport does).
 type JSONRPCRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      any             `json:"id,omitempty"`

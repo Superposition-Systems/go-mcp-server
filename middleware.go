@@ -87,23 +87,23 @@ func responseTransformerMiddleware(t ResponseTransformer) ToolMiddleware {
 func buildToolCallChain(s *Server) ToolCallFunc {
 	inner := adaptToolHandler(s.tools)
 
+	// Unwrap the *Registry once. The alias middleware needs it to consult
+	// each tool's InputSchema for canonical-name membership; the validator
+	// middleware needs it to look up the compiled schema. When the Server's
+	// ToolHandler is registry-backed (the common case via
+	// reg.AsToolHandler()) — or wrapped by elevation around a registry —
+	// we drill through; otherwise both middlewares degrade to identity per
+	// their nil-registry fast-paths.
+	reg := unwrapRegistry(s.tools)
+
 	// Innermost wrappers first (they sit closest to dispatch).
 	if s.responseTransformer != nil {
 		inner = responseTransformerMiddleware(s.responseTransformer)(inner)
 	}
 	if len(s.validationOptions) > 0 {
-		inner = inputValidationMiddleware(s.validationOptions)(inner)
+		inner = buildValidationMiddleware(reg, s.suggestionHook, s.validationOptions)(inner)
 	}
-	if s.paramAliases != nil {
-		// The alias middleware needs the *Registry to consult each tool's
-		// InputSchema for canonical-name membership. When the Server's
-		// ToolHandler is registry-backed (the common case via
-		// reg.AsToolHandler()), we unwrap it; otherwise the middleware
-		// degrades to identity per its nil-registry fast-path.
-		var reg *Registry
-		if h, ok := s.tools.(*registryHandler); ok {
-			reg = h.r
-		}
+	if len(s.paramAliases) > 0 {
 		inner = newParamAliasMiddleware(s.paramAliases, reg, s.suggestionHook)(inner)
 	}
 
@@ -111,4 +111,24 @@ func buildToolCallChain(s *Server) ToolCallFunc {
 	// WithToolMiddleware — applyMiddlewares handles the outermost-first
 	// wrapping.
 	return applyMiddlewares(inner, s.toolMiddleware)
+}
+
+// unwrapRegistry peels the known library wrappers off a ToolHandler to
+// retrieve the backing *Registry, or returns nil if the handler is not
+// registry-backed. Handles the two shapes the library itself produces:
+// a bare *registryHandler from Registry.AsToolHandler, and an
+// *elevationTools wrapping either shape when WithElevation is installed.
+// Consumer-owned wrappers are not peeled — middlewares degrade to identity
+// in that case, matching the documented nil-registry behaviour.
+func unwrapRegistry(h ToolHandler) *Registry {
+	for {
+		switch v := h.(type) {
+		case *registryHandler:
+			return v.r
+		case *elevationTools:
+			h = v.inner
+		default:
+			return nil
+		}
+	}
 }

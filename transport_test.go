@@ -216,6 +216,33 @@ func TestNotificationsReturn202(t *testing.T) {
 	}
 }
 
+// TestNotificationByAbsentID exercises JSON-RPC 2.0 §4.1: a request with
+// no "id" field is a notification for ANY method name, and the server
+// MUST NOT reply. Prior to the transport fix, an absent id decoded to the
+// same `nil` as an explicit null id, and arbitrary notifications fell
+// through to the default -32601 path — observable as a spec violation
+// from any strict client.
+func TestNotificationByAbsentID(t *testing.T) {
+	handler, _ := newTestHandler()
+
+	// Explicitly omit id — this is the important case.
+	for _, method := range []string{"ping", "tools/list", "custom/notification", "bogus"} {
+		body := `{"jsonrpc":"2.0","method":"` + method + `"}`
+		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		if rec.Code != http.StatusAccepted {
+			t.Errorf("method %q without id: expected 202, got %d (body=%q)", method, rec.Code, rec.Body.String())
+		}
+		if rec.Body.Len() != 0 {
+			t.Errorf("method %q without id: expected empty body, got %q", method, rec.Body.String())
+		}
+	}
+}
+
 func TestUnknownMethodReturns32601(t *testing.T) {
 	handler, _ := newTestHandler()
 	rec := doPost(handler, "bogus/method", nil)

@@ -247,7 +247,21 @@ func (s *Store) getFromDB(key string) (string, bool, error) {
 // CredentialsFile is configured, atomically rewrites the file to reflect
 // the full current SQLite table. SQLite is the source of truth: a SQLite
 // write error aborts and the file is left unchanged.
+//
+// key must match env-var shape (ASCII letters, digits, and underscore;
+// non-empty; not starting with a digit). value must not contain '\n' or
+// '\r'. Both constraints exist because keys and values are serialised to
+// the credentials file as literal "KEY=VALUE\n"; admitting newline or
+// non-env characters there would let a caller inject additional rows
+// (and, via the Open-time env mirror at §3.8 seed step, the process
+// environment on the next restart).
 func (s *Store) Set(key, value string) error {
+	if err := validateKey(key); err != nil {
+		return fmt.Errorf("config.Set: %w", err)
+	}
+	if strings.ContainsAny(value, "\n\r") {
+		return fmt.Errorf("config.Set: value must not contain newline characters")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -270,7 +284,15 @@ func (s *Store) Set(key, value string) error {
 
 // Delete removes key from SQLite (idempotent — absence is not an error)
 // and, if CredentialsFile is configured, atomically rewrites the file.
+//
+// key must satisfy the same validateKey shape that Set enforces. This
+// symmetry prevents confusing behaviour where a key that could never
+// have been successfully written via the public API reports a clean
+// delete.
 func (s *Store) Delete(key string) error {
+	if err := validateKey(key); err != nil {
+		return fmt.Errorf("config.Delete: %w", err)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -289,24 +311,41 @@ func (s *Store) Delete(key string) error {
 // List returns a copy of the SQLite table as a map. Does NOT merge
 // the credentials file or environment — callers that want the merged
 // view call Get per key.
+//
+// Preserves the pre-v0.8.0 "never returns an error" contract. Callers
+// that need to distinguish "empty store" from "unreadable store" should
+// use listWithErr (unexported). handleList (config_list) switches to
+// listWithErr so a corrupt DB surfaces as a tool error instead of a
+// silent empty-keys response.
 func (s *Store) List() map[string]string {
+	out, _ := s.listWithErr()
+	return out
+}
+
+// listWithErr is the error-returning form of List. Returns the (possibly
+// partial) map plus the first error encountered. Internal-only so we
+// don't break the public List signature documented in §4.8.
+func (s *Store) listWithErr() (map[string]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	out := map[string]string{}
 	rows, err := s.db.Query("SELECT key, value FROM config")
 	if err != nil {
-		return out
+		return out, fmt.Errorf("config.List: query: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var k, v string
 		if err := rows.Scan(&k, &v); err != nil {
-			continue
+			return out, fmt.Errorf("config.List: scan: %w", err)
 		}
 		out[k] = v
 	}
-	return out
+	if err := rows.Err(); err != nil {
+		return out, fmt.Errorf("config.List: iterate: %w", err)
+	}
+	return out, nil
 }
 
 // rewriteCredentialsFile atomically writes CredentialsFile from the
@@ -357,6 +396,30 @@ func (s *Store) rewriteCredentialsFile() error {
 		// Best-effort cleanup so a stale .tmp does not accumulate.
 		_ = os.Remove(tmp)
 		return fmt.Errorf("rename tmp: %w", err)
+	}
+	return nil
+}
+
+// validateKey rejects keys that would corrupt the credentials-file
+// serialisation or the env-var mirror. The shape matches POSIX portable
+// env-var names: a non-empty ASCII identifier that does not start with a
+// digit. This intentionally also rejects '\n', '\r', '=' and whitespace.
+func validateKey(key string) error {
+	if key == "" {
+		return errors.New("key must not be empty")
+	}
+	for i, r := range key {
+		switch {
+		case r >= 'A' && r <= 'Z':
+		case r >= 'a' && r <= 'z':
+		case r == '_':
+		case r >= '0' && r <= '9':
+			if i == 0 {
+				return fmt.Errorf("key %q: must not start with a digit", key)
+			}
+		default:
+			return fmt.Errorf("key %q: contains disallowed character %q (allowed: [A-Za-z0-9_], not leading digit)", key, r)
+		}
 	}
 	return nil
 }
@@ -527,8 +590,16 @@ func (s *Store) handleSet(_ context.Context, args map[string]any) (any, error) {
 // handleList implements the config_list tool. Returns keys only (never
 // values) so the tool's output is safe to log even when values are
 // secrets.
+//
+// Propagates any DB error from listWithErr so an unreadable store is
+// visible to the caller as a tool error instead of a silently-empty
+// key set — the latter would be indistinguishable from "no keys set"
+// and would hide a real operational failure.
 func (s *Store) handleList(_ context.Context, _ map[string]any) (any, error) {
-	m := s.List()
+	m, err := s.listWithErr()
+	if err != nil {
+		return nil, err
+	}
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)

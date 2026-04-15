@@ -189,10 +189,20 @@ func (l *Logger) Slog() *slog.Logger {
 
 // Close closes the underlying SQLite database. Safe to call multiple
 // times; subsequent calls return the error from the first Close.
+//
+// Close takes l.mu so it observes a consistent state with in-flight
+// writers (write / handleGetLogs / handleGetStats / handleClearLogs),
+// and nil-clears l.db under the same lock so the (l.db == nil) guards
+// in those methods actually fire after Close returns. Without this the
+// guards are dead code — l.db becomes non-nil-but-closed, and callers
+// get sql.ErrConnDone leaking out as a query error.
 func (l *Logger) Close() error {
 	l.closeOnce.Do(func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
 		if l.db != nil {
 			l.closeErr = l.db.Close()
+			l.db = nil
 		}
 	})
 	return l.closeErr
