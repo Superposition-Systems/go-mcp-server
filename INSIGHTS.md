@@ -305,3 +305,35 @@ _2026-04-15 12:27_
 `★ Insight ─────────────────────────────────────`
 The skill.go sanitiser is worth a note on *threat model surface shift*. The library's original trust model was "registered tools are trusted code" — which is true when you hand-write `reg.Register(...)`. But the moment a consumer wires a mux around a 3rd-party API whose tool names come from that API (GitHub's GraphQL schema, Atlassian's REST catalogue), tool metadata is no longer fully consumer-controlled. The sanitiser moves the library's trust boundary from "all registered strings are safe" to "all registered strings are rendered safely." Small scope change, meaningful blast-radius reduction.
 `─────────────────────────────────────────────────`
+---
+_2026-04-15 12:49_
+
+`★ Insight ─────────────────────────────────────`
+- The mux is itself just a `*Registry` — `NewMux` at `mux.go:77` returns a *fresh* registry populated with 4 synthesized dispatcher tools whose handlers close over the underlying registry. So "bypass the mux" isn't a special mode; it's just "don't call `NewMux`."
+- The sealing cascade (`registry.go:173`) is the one subtle coupling: when the mux wraps an underlying registry, `markStarted` walks `parent` so sealing the outer seals the inner. Direct-registry consumers skip this entirely — only their own registry gets sealed on `ListenAndServe`.
+- Middleware (aliases, validation, compaction) lives on the `Server`, not the `Registry`, which is why it works uniformly on both paths. The mux's *internal* alias rewriter at `mux.go:195` exists only because outer-chain middleware can't see the nested `args` payload that `<prefix>_execute` unwraps — a detail that vanishes when you bypass the mux.
+`─────────────────────────────────────────────────`
+---
+_2026-04-15 12:50_
+
+`★ Insight ─────────────────────────────────────`
+- The three channels have different failure modes. `CLAUDE.md` is read by every session in the repo — including sessions run by collaborators — so it's the right place for *shared* architectural invariants. Memory is yours alone; it travels with your machine, not the repo. `INSIGHTS.md` is a timeline, so entries decay in relevance and readers don't treat old ones as load-bearing.
+- For the specific class of fact "X is already supported, don't rebuild it," `CLAUDE.md` wins decisively — the failure mode you're preventing (an agent reinventing the direct-exposure path) is exactly what a session-start preamble catches. A memory entry would protect future *you*, but not a collaborator's session or a fresh clone.
+- One tradeoff: `CLAUDE.md` becomes a budget-consumed context cost on every session in this repo, so it should stay tight — a one-liner pointing at `README.md:321-355` is better than a duplicated explanation.
+`─────────────────────────────────────────────────`
+---
+_2026-04-17 16:04_
+
+`★ Insight ─────────────────────────────────────`
+- The `SELECT *` + positional `Scan` in `GetClient` at `auth/store.go:275-283` is coupled to the exact column order in `createTables`. As soon as a future schema change adds or reorders a column, `Scan` reads `client_secret` (or some other TEXT) into `ClientIDIssuedAt` (INTEGER), returning a scan error — which `oauth.go:262` then displays to end users as "Unknown client_id." That's three bugs chained: schema fragility → silent scan error → misleading user message.
+- Adding a `schema_version` table is the standard idiom, but for a library shipping across multiple consumer databases, the migration logic has to be idempotent AND detect "table already has the new columns from an ad-hoc manual migration" — otherwise you brick a database on restart. A safer v1 is to only *record* the version (no migrations yet) so future versions have a checkpoint to migrate FROM.
+- For the middleware-validation-path signal, the cleanest Go idiom is a typed context value (not a stringly-typed tag) so callers get compile-time safety. The existing `tokenHashKeyType struct{}` pattern in `auth/context.go:10` is the template to mirror.
+`─────────────────────────────────────────────────`
+---
+_2026-04-17 16:08_
+
+`★ Insight ─────────────────────────────────────`
+- The `schema_version` table uses `CREATE TABLE IF NOT EXISTS` + a separate seed-if-empty check rather than `INSERT OR IGNORE` with a hardcoded primary key. The reason: future migrations will need to UPDATE the row, and having a PK means picking a magic value (always id=1?) that leaks into migration SQL. A single-row table with no PK is uglier but carries no embedded assumption future code has to honor.
+- The authorize-POST `GetClient` log keeps `sql.ErrNoRows` (unlike authorize-GET) because at that point the client_id came from `auth_requests` — a table we just wrote 10s ago. "Row disappeared" there means either someone is racing deletion or the DB is unhappy, both of which operators want to see.
+- `AuthPath` is a named `string` type, not a raw `string`. This gives callers a compile-time error if they pass a typo'd literal into `GetAuthPath`'s comparand — the common footgun when context values are stringly-typed.
+`─────────────────────────────────────────────────`

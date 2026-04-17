@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.3] — 2026-04-17
+
+### Fixed
+
+- **`OAuthStore.GetClient` now selects columns by name.** Previously used
+  `SELECT *` with a positional `Scan`, which was bound to the exact
+  column order of `createTables`. A future schema change would have
+  silently shifted values into the wrong fields, surfacing as a scan
+  error that both authorize-GET and authorize-POST mapped to the
+  user-facing "Unknown client_id." message — a misleading error for
+  end users and a long debugging path for operators. Fix: the SELECT
+  now names every column explicitly so column-list and Scan-target
+  ordering live in the same source file.
+- **Underlying `GetClient` errors are now logged at WARN** at both
+  authorize sites. The user-facing "Unknown client_id." message is
+  preserved (no new leakage to clients scraping the endpoint), but
+  operators debugging a misconfigured deployment now see the real
+  error in the log. `sql.ErrNoRows` is suppressed on the authorize-GET
+  path (a legitimate client-id typo would otherwise be noisy) but
+  logged on the authorize-POST path — at that point the ID came from
+  the `auth_requests` row we wrote seconds ago, so "row disappeared"
+  is suspicious.
+
+### Added
+
+- **Schema-version checkpoint.** New `schema_version` table carries a
+  single row set to `1` on fresh and legacy databases. Future library
+  versions that change the schema will read this value, run migrations
+  up to `currentSchemaVersion`, and write the new version back. This
+  release does no migrations — it only establishes the checkpoint so
+  future versions have a basis to migrate from. Existing databases
+  created before this release are seeded automatically on first open
+  (treated as version 1).
+- **`auth.AuthPath` context stamp.** `BearerMiddleware` now records
+  which of its three validation branches accepted a request
+  (`AuthPathCustomValidator`, `AuthPathStaticBearer`, `AuthPathOAuth`)
+  on the request context. Downstream middleware and handlers can
+  inspect this with `auth.GetAuthPath(ctx)` to reason about the auth
+  source without having to rerun validation. `AuthPath` is a named
+  `string` type rather than a raw `string` so callers get compile-time
+  type safety against typo'd literals in comparisons.
+
+  Motivation: a recent enrichment bug was traced back to not knowing
+  which path accepted a token — the request had arrived via the static
+  bearer but downstream code assumed OAuth because that was the most
+  common shape.
+
 ## [v0.8.2] — 2026-04-16
 
 ### Added

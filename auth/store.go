@@ -213,8 +213,41 @@ func (s *OAuthStore) createTables() error {
 		CREATE INDEX IF NOT EXISTS idx_access_tokens_expires_at  ON access_tokens(expires_at);
 		CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires_at ON refresh_tokens(expires_at);
 		CREATE INDEX IF NOT EXISTS idx_auth_requests_created_at  ON auth_requests(created_at);
+		-- Schema version checkpoint. Carries a single row. Future
+		-- library versions that change the schema will read this
+		-- value, run migrations up to currentSchemaVersion, and write
+		-- the new version back. This release does no migrations — it
+		-- only establishes the checkpoint.
+		CREATE TABLE IF NOT EXISTS schema_version (
+			version INTEGER NOT NULL
+		);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.initSchemaVersion()
+}
+
+// currentSchemaVersion is the schema revision written into schema_version
+// on fresh databases. Bump in lockstep with any change to createTables.
+const currentSchemaVersion = 1
+
+// initSchemaVersion ensures schema_version has exactly one row. An
+// empty table (fresh DB, or DB created before this table existed) gets
+// seeded with currentSchemaVersion. A populated table is left alone —
+// we do not downgrade or overwrite a version that a future release may
+// have already bumped.
+func (s *OAuthStore) initSchemaVersion() error {
+	var count int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count); err != nil {
+		return fmt.Errorf("read schema_version: %w", err)
+	}
+	if count == 0 {
+		if _, err := s.db.Exec("INSERT INTO schema_version (version) VALUES (?)", currentSchemaVersion); err != nil {
+			return fmt.Errorf("seed schema_version: %w", err)
+		}
+	}
+	return nil
 }
 
 // RegisterClient performs RFC 7591 dynamic client registration. The
@@ -271,8 +304,19 @@ func (s *OAuthStore) RegisterClient(metadata map[string]any) (*ClientData, error
 // GetClient retrieves a client by ID. The returned ClientData never
 // carries ClientSecret — use VerifyClientSecret to authenticate a
 // client's credentials.
+//
+// The SELECT names every column explicitly rather than SELECT * so the
+// column order is bound to this source file, not to whatever order the
+// schema happens to have on a given deployment. Without this, adding
+// or reordering columns in createTables (or any future migration) would
+// misalign the positional Scan and surface as a spurious "scan failed"
+// error that callers already map to "Unknown client_id."
 func (s *OAuthStore) GetClient(clientID string) (*ClientData, error) {
-	row := s.db.QueryRow("SELECT * FROM clients WHERE client_id = ?", clientID)
+	row := s.db.QueryRow(
+		`SELECT client_id, client_secret, client_id_issued_at,
+			redirect_uris, token_endpoint_auth_method, grant_types,
+			response_types, scope, client_name
+		 FROM clients WHERE client_id = ?`, clientID)
 	var c ClientData
 	var redirectURIs, grantTypes, responseTypes string
 	var storedHash string

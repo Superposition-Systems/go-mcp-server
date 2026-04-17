@@ -200,27 +200,31 @@ func BearerMiddleware(bearerToken string, tokenValidator func(string) bool, stor
 
 			// On any successful auth path, stash a hash of the token on the
 			// context so downstream handlers can identify this session without
-			// ever touching the raw secret.
-			passWithHash := func() {
+			// ever touching the raw secret. The AuthPath label records which
+			// of the three validation branches accepted this request so
+			// downstream middleware can distinguish sources (e.g. only apply
+			// certain enrichments to OAuth-authenticated sessions).
+			passWith := func(path AuthPath) {
 				ctx := WithTokenHash(r.Context(), TokenHash(token))
+				ctx = WithAuthPath(ctx, path)
 				next.ServeHTTP(w, r.WithContext(ctx))
 			}
 
 			// Custom token validator (supports multi-token, scoped auth, etc.)
 			if tokenValidator != nil && tokenValidator(token) {
-				passWithHash()
+				passWith(AuthPathCustomValidator)
 				return
 			}
 
 			// Static bearer token (CLI tools)
 			if bearerToken != "" && SafeEqual(token, bearerToken) {
-				passWithHash()
+				passWith(AuthPathStaticBearer)
 				return
 			}
 
 			// OAuth access token (claude.ai)
 			if store != nil && store.VerifyAccessToken(token, requiredScope) {
-				passWithHash()
+				passWith(AuthPathOAuth)
 				return
 			}
 

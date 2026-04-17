@@ -3,8 +3,10 @@ package auth
 import (
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -260,6 +262,15 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 
 	client, err := h.Store.GetClient(q.Get("client_id"))
 	if err != nil || client == nil {
+		// User-facing message stays generic so an attacker scraping
+		// the authorize endpoint can't distinguish "unknown client"
+		// from "DB scan broke" from "store went away." Operators
+		// debugging a misconfigured deployment need the real error,
+		// though, so log it at WARN — but skip the expected
+		// no-rows case so the log isn't noisy for legitimate typos.
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("mcpserver: WARN authorize GET GetClient(%q) failed: %v", q.Get("client_id"), err)
+		}
 		h.renderPINErr(w, http.StatusBadRequest, "", "Unknown client_id.")
 		return
 	}
@@ -359,6 +370,13 @@ func (h *OAuthHandler) AuthorizePOST(w http.ResponseWriter, r *http.Request) {
 
 	client, err := h.Store.GetClient(authCtx["client_id"])
 	if err != nil || client == nil {
+		// See note on the authorize-GET branch above. The no-rows
+		// case here is more suspicious (the client_id was valid
+		// seconds ago at the GET), so we still log sql.ErrNoRows
+		// at WARN — a client row deleted mid-flow is worth knowing.
+		if err != nil {
+			log.Printf("mcpserver: WARN authorize POST GetClient(%q) failed: %v", authCtx["client_id"], err)
+		}
 		h.renderPINErr(w, http.StatusBadRequest, "", "Unknown client_id")
 		return
 	}
