@@ -295,6 +295,9 @@ func muxListToolsHandler(underlying *Registry) func(context.Context, map[string]
 				"category":    t.Category,
 				"tags":        append([]string(nil), t.Tags...),
 			}
+			if t.Annotations != nil {
+				entry["annotations"] = t.Annotations
+			}
 			out = append(out, entry)
 		}
 		return map[string]any{"tools": out}, nil

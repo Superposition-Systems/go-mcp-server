@@ -25,6 +25,7 @@ type Tool struct {
 	Category     string
 	Tags         []string
 	ParamAliases map[string]string
+	Annotations  *ToolAnnotations
 	Handler      func(ctx context.Context, args map[string]any) (any, error)
 }
 
@@ -190,6 +191,7 @@ func (h *registryHandler) ListTools() []ToolDef {
 			Name:        t.Name,
 			Description: t.Description,
 			InputSchema: t.InputSchema,
+			Annotations: t.Annotations,
 		})
 	}
 	return out

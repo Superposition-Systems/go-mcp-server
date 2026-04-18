@@ -22,12 +22,26 @@ type ToolHandler interface {
 	Call(ctx context.Context, name string, args map[string]any) (result any, isError bool)
 }
 
+// ToolAnnotations holds MCP tool annotation hints (2025-03-26 spec).
+// All fields are pointers so omitted hints are absent from the wire,
+// not false — the spec distinguishes "unset" from "false".
+type ToolAnnotations struct {
+	ReadOnlyHint    *bool `json:"readOnlyHint,omitempty"`
+	DestructiveHint *bool `json:"destructiveHint,omitempty"`
+	IdempotentHint  *bool `json:"idempotentHint,omitempty"`
+	OpenWorldHint   *bool `json:"openWorldHint,omitempty"`
+}
+
 // ToolDef is a single MCP tool definition returned by tools/list.
 type ToolDef struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	InputSchema any    `json:"inputSchema"`
+	Name        string           `json:"name"`
+	Description string           `json:"description"`
+	InputSchema any              `json:"inputSchema"`
+	Annotations *ToolAnnotations `json:"annotations,omitempty"`
 }
+
+// BoolPtr is a convenience for building ToolAnnotations literals inline.
+func BoolPtr(v bool) *bool { return &v }
 
 // ServerInfo identifies this MCP server to clients during initialization.
 type ServerInfo struct {
