@@ -113,15 +113,25 @@ type ToolHandler interface {
 }
 
 type ToolDef struct {
-    Name        string `json:"name"`
-    Description string `json:"description"`
-    InputSchema any    `json:"inputSchema"`
+    Name        string           `json:"name"`
+    Description string           `json:"description"`
+    InputSchema any              `json:"inputSchema"`
+    Annotations *ToolAnnotations `json:"annotations,omitempty"`
+}
+
+type ToolAnnotations struct {
+    ReadOnlyHint    *bool `json:"readOnlyHint,omitempty"`
+    DestructiveHint *bool `json:"destructiveHint,omitempty"`
+    IdempotentHint  *bool `json:"idempotentHint,omitempty"`
+    OpenWorldHint   *bool `json:"openWorldHint,omitempty"`
 }
 ```
 
 `ListTools()` returns MCP tool definitions (including JSON Schema for arguments). `Call()` dispatches tool invocations by name. Return `isError: true` to signal a tool-level error to the client.
 
-For servers with more than a handful of tools, the [Registry](#extension-layer-v080) added in v0.8.0 is usually a nicer fit than implementing this interface directly — each tool is a self-describing struct with category, alias, and schema metadata, and `Registry.AsToolHandler()` produces the same interface.
+`Annotations` carries optional [MCP tool annotation hints](https://modelcontextprotocol.io/specification/2025-03-26/server/tools#annotations) that describe a tool's side-effect profile. All fields are `*bool` — `nil` means "unspecified" (omitted from the wire), while `&false` explicitly declares the hint as false. Use `BoolPtr(v)` for inline construction. When set on a `Tool` in the Registry, annotations flow through to the `tools/list` response and the mux `list_tools` output automatically.
+
+For servers with more than a handful of tools, the [Registry](#extension-layer-v080) added in v0.8.0 is usually a nicer fit than implementing this interface directly — each tool is a self-describing struct with category, alias, annotation, and schema metadata, and `Registry.AsToolHandler()` produces the same interface.
 
 ## Configuration Options
 
@@ -330,6 +340,12 @@ reg.MustRegister(mcpserver.Tool{
     Category:    "Issues",
     InputSchema: json.RawMessage(`{"type":"object","properties":{"issueKeyOrId":{"type":"string"}},"required":["issueKeyOrId"]}`),
     ParamAliases: map[string]string{"issueKey": "issueKeyOrId", "key": "issueKeyOrId"},
+    Annotations: &mcpserver.ToolAnnotations{
+        ReadOnlyHint:    mcpserver.BoolPtr(true),
+        DestructiveHint: mcpserver.BoolPtr(false),
+        IdempotentHint:  mcpserver.BoolPtr(true),
+        OpenWorldHint:   mcpserver.BoolPtr(true),
+    },
     Handler: func(ctx context.Context, args map[string]any) (any, error) {
         return jiraClient.GetIssue(ctx, args["issueKeyOrId"].(string))
     },
