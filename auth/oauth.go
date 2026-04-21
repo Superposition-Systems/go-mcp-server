@@ -57,6 +57,22 @@ type OAuthConfig struct {
 	// limiting. Leave empty to use r.RemoteAddr directly (appropriate
 	// when no proxy is in front of this server).
 	TrustedProxyCIDRs []string
+
+	// RequireResourceIndicator, when true, mandates that every
+	// /authorize and /token request include an RFC 8707 `resource`
+	// parameter matching the server's canonical resource URI. Defaults
+	// to false for backwards compatibility with pre-2025-06-18 MCP
+	// clients (claude.ai and Claude Code on older negotiated protocol
+	// versions won't send the parameter). Set to true once all clients
+	// in a deployment are known to send it — the 2025-06-18 spec says
+	// clients MUST include it, so a strict deployment should too.
+	//
+	// Independently of this flag, when the client DOES send a resource
+	// parameter, the server always validates it against the canonical
+	// resource URI and binds the issued token to that audience — so
+	// audience binding kicks in automatically as clients upgrade, with
+	// no library change needed.
+	RequireResourceIndicator bool
 }
 
 // OAuthHandler serves all OAuth 2.0 endpoints: discovery, registration,
@@ -102,6 +118,62 @@ func NewOAuthHandler(store *OAuthStore, cfg OAuthConfig) *OAuthHandler {
 	return h
 }
 
+// CanonicalResource returns the RFC 8707 canonical resource URI this
+// server advertises — the same value emitted in ProtectedResource's
+// `resource` field. Returns "" if the handler has no ExternalURL
+// configured (local dev); callers should treat that as "no canonical
+// resource, skip enforcement."
+//
+// Exposed so the surrounding Server can pass it into BearerMiddleware
+// for audience enforcement on incoming requests.
+func (h *OAuthHandler) CanonicalResource() string {
+	if h.config.ExternalURL == "" {
+		return ""
+	}
+	return strings.TrimRight(h.config.ExternalURL, "/") + h.config.ResourcePath
+}
+
+// validateResourceParam enforces RFC 8707 §2: the client-supplied
+// `resource` value must match the server's canonical resource URI
+// exactly. Returns (effective, ok) where effective is the value to
+// persist ("" for a legacy client that omitted the parameter, the
+// canonical value for a conforming one) and ok is whether the request
+// may proceed. Callers surface a non-ok return as `invalid_target`.
+//
+// Policy:
+//
+//	raw=""  + Require=false → ok, effective=""    (legacy tolerance)
+//	raw=""  + Require=true  → rejected            (strict mode)
+//	raw=X   + X == canonical → ok, effective=X
+//	raw=X   + X != canonical → rejected
+//	raw=X   + canonical=""   → rejected (client asked for a specific
+//	                           resource but the server has no
+//	                           ExternalURL to match against; refusing
+//	                           is safer than silently accepting an
+//	                           unverifiable audience claim).
+//
+// Multiple `resource` values (RFC 8707 allows repetition) are rejected
+// for this release — the MCP spec narrows RFC 8707 to "a single
+// canonical URI for the MCP server" and supporting multi-audience
+// tokens would widen the surface without a consumer that needs it.
+func (h *OAuthHandler) validateResourceParam(raws []string) (effective string, ok bool) {
+	if len(raws) > 1 {
+		return "", false
+	}
+	raw := ""
+	if len(raws) == 1 {
+		raw = raws[0]
+	}
+	if raw == "" {
+		return "", !h.config.RequireResourceIndicator
+	}
+	canonical := h.CanonicalResource()
+	if canonical == "" || raw != canonical {
+		return "", false
+	}
+	return canonical, true
+}
+
 // Discovery returns RFC 8414 OAuth authorization server metadata.
 func (h *OAuthHandler) Discovery(w http.ResponseWriter, r *http.Request) {
 	base, ok := baseURLOrError(h.config, r, w)
@@ -119,6 +191,14 @@ func (h *OAuthHandler) Discovery(w http.ResponseWriter, r *http.Request) {
 		"token_endpoint_auth_methods_supported": []string{"client_secret_post"},
 		"code_challenge_methods_supported":      []string{"S256"},
 		"scopes_supported":                      []string{h.config.Scope},
+		// Advertise RFC 8707 support. Clients that see this field know
+		// they may (and, under the 2025-06-18 MCP revision, MUST)
+		// include a `resource` parameter on /authorize and /token.
+		// When this server has no ExternalURL configured the canonical
+		// resource is "" and the indicator is effectively an opt-out
+		// even when the field says "true" — validateResourceParam
+		// rejects any non-empty resource in that mode.
+		"resource_indicators_supported": true,
 	})
 }
 
@@ -300,6 +380,17 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// RFC 8707 Resource Indicator. validateResourceParam handles the
+	// Require-vs-tolerate policy and the equality check against the
+	// canonical URI; we just need to persist the effective value (which
+	// is "" for a legacy client and the canonical URI for a conforming
+	// one) so AuthorizePOST can carry it into the auth_codes row.
+	resourceEffective, resourceOK := h.validateResourceParam(q["resource"])
+	if !resourceOK {
+		h.renderPINErr(w, http.StatusBadRequest, "", "Invalid resource parameter.")
+		return
+	}
+
 	// Store auth request server-side (not in form)
 	requestID := uuid.New().String()
 	if err := h.Store.StoreAuthRequest(requestID, map[string]string{
@@ -309,6 +400,7 @@ func (h *OAuthHandler) AuthorizeGET(w http.ResponseWriter, r *http.Request) {
 		"code_challenge":        codeChallenge,
 		"code_challenge_method": ccm,
 		"scope":                 reqScope,
+		"resource":              resourceEffective,
 	}); err != nil {
 		h.renderPINErr(w, http.StatusInternalServerError, "", "Server error.")
 		return
@@ -405,6 +497,7 @@ func (h *OAuthHandler) AuthorizePOST(w http.ResponseWriter, r *http.Request) {
 		CodeChallenge:       authCtx["code_challenge"],
 		CodeChallengeMethod: authCtx["code_challenge_method"],
 		Scope:               authCtx["scope"],
+		Resource:            authCtx["resource"],
 		CreatedAt:           time.Now().Unix(),
 	}); err != nil {
 		h.renderPINErr(w, http.StatusInternalServerError, "", "Failed to create authorization code.")
@@ -488,20 +581,54 @@ func (h *OAuthHandler) exchangeAuthCode(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// RFC 8707 §2.2: if the authorization request asserted a resource,
+	// the token request MUST assert the same resource (or a subset —
+	// the MCP spec narrows to a single canonical URI, so "same" is
+	// equivalent here). We validate both sides:
+	//
+	//   1. The form-supplied resource (if any) matches the canonical URI.
+	//   2. The form-supplied resource matches what was recorded at
+	//      /authorize for this code.
+	//
+	// When RequireResourceIndicator is set, the /authorize side of (1)
+	// already rejected the legacy-omit path; the /token side is kept
+	// symmetric so a misbehaving client that passed resource only at
+	// /authorize is also rejected.
+	tokResourceEffective, tokResourceOK := h.validateResourceParam(r.Form["resource"])
+	if !tokResourceOK {
+		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_target", "error_description": "invalid resource parameter"})
+		return
+	}
+	if tokResourceEffective != codeData.Resource {
+		writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_target", "error_description": "resource mismatch with authorization request"})
+		return
+	}
+
 	now := time.Now().Unix()
 	// Scope the issued token to exactly what the client requested.
 	// Do NOT widen to the server default — a client that asked for no
 	// scope must not receive a maximally-privileged token.
 	scope := codeData.Scope
+	// Audience is carried through from the validated resource. A legacy
+	// flow (no resource at /authorize, no resource at /token) binds an
+	// empty audience and the token is accepted by any
+	// audience-tolerant middleware — preserving pre-v0.9 behaviour.
+	audience := codeData.Resource
 
 	accessToken := RandomHex(32)
-	if err := h.Store.StoreAccessToken(accessToken, TokenData{ClientID: clientID, Scope: scope, ExpiresAt: now + 3600, CreatedAt: now}); err != nil {
+	if err := h.Store.StoreAccessToken(accessToken, TokenData{
+		ClientID: clientID, Scope: scope, Audience: audience,
+		ExpiresAt: now + 3600, CreatedAt: now,
+	}); err != nil {
 		writeOAuthJSON(w, http.StatusInternalServerError, map[string]any{"error": "server_error"})
 		return
 	}
 
 	refreshToken := RandomHex(32)
-	if err := h.Store.StoreRefreshToken(refreshToken, TokenData{ClientID: clientID, Scope: scope, ExpiresAt: now + 30*24*3600, CreatedAt: now}); err != nil {
+	if err := h.Store.StoreRefreshToken(refreshToken, TokenData{
+		ClientID: clientID, Scope: scope, Audience: audience,
+		ExpiresAt: now + 30*24*3600, CreatedAt: now,
+	}); err != nil {
 		writeOAuthJSON(w, http.StatusInternalServerError, map[string]any{"error": "server_error"})
 		return
 	}
@@ -578,17 +705,47 @@ func (h *OAuthHandler) exchangeRefreshToken(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// RFC 8707 §2.2: on refresh, the new access token MUST be bound to
+	// the same audience(s) as the refresh token. If the client presents
+	// a `resource` parameter here, it must equal the already-bound
+	// audience — a token originally issued for resource A cannot be
+	// refreshed into a token for resource B. An empty audience on the
+	// refresh token (legacy flow) is preserved through the refresh so
+	// a pre-v0.9 client's tokens keep working indefinitely.
+	if reqResources := r.Form["resource"]; len(reqResources) > 0 {
+		// We do NOT gate on RequireResourceIndicator here because the
+		// refresh path is independent of whether the original /token
+		// exchange required the parameter — the binding the refresh
+		// MUST preserve is whatever audience was recorded on the
+		// refresh token row.
+		if len(reqResources) > 1 {
+			writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_target", "error_description": "multiple resource values not supported"})
+			return
+		}
+		if reqResources[0] != tokenData.Audience {
+			writeOAuthJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_target", "error_description": "resource does not match refresh token audience"})
+			return
+		}
+	}
+
 	now := time.Now().Unix()
 	scope := tokenData.Scope
+	audience := tokenData.Audience // inherit from refresh token
 
 	newAT := RandomHex(32)
-	if err := h.Store.StoreAccessToken(newAT, TokenData{ClientID: clientID, Scope: scope, ExpiresAt: now + 3600, CreatedAt: now}); err != nil {
+	if err := h.Store.StoreAccessToken(newAT, TokenData{
+		ClientID: clientID, Scope: scope, Audience: audience,
+		ExpiresAt: now + 3600, CreatedAt: now,
+	}); err != nil {
 		writeOAuthJSON(w, http.StatusInternalServerError, map[string]any{"error": "server_error"})
 		return
 	}
 
 	newRT := RandomHex(32)
-	if err := h.Store.StoreRefreshToken(newRT, TokenData{ClientID: clientID, Scope: scope, ExpiresAt: now + 30*24*3600, CreatedAt: now}); err != nil {
+	if err := h.Store.StoreRefreshToken(newRT, TokenData{
+		ClientID: clientID, Scope: scope, Audience: audience,
+		ExpiresAt: now + 30*24*3600, CreatedAt: now,
+	}); err != nil {
 		writeOAuthJSON(w, http.StatusInternalServerError, map[string]any{"error": "server_error"})
 		return
 	}

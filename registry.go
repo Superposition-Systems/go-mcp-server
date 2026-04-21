@@ -22,6 +22,7 @@ type Tool struct {
 	Name         string
 	Description  string
 	InputSchema  json.RawMessage
+	OutputSchema json.RawMessage
 	Category     string
 	Tags         []string
 	ParamAliases map[string]string
@@ -187,11 +188,21 @@ func (h *registryHandler) ListTools() []ToolDef {
 	tools := h.r.All()
 	out := make([]ToolDef, 0, len(tools))
 	for _, t := range tools {
+		// A nil json.RawMessage assigned to an `any` field becomes a
+		// typed-nil interface — omitempty does NOT drop it, and
+		// RawMessage.MarshalJSON emits "null" rather than being skipped.
+		// Gate the assignment so an unset OutputSchema is truly absent
+		// from the wire, matching the pre-v0.9 tools/list shape.
+		var outputSchema any
+		if len(t.OutputSchema) > 0 {
+			outputSchema = t.OutputSchema
+		}
 		out = append(out, ToolDef{
-			Name:        t.Name,
-			Description: t.Description,
-			InputSchema: t.InputSchema,
-			Annotations: t.Annotations,
+			Name:         t.Name,
+			Description:  t.Description,
+			InputSchema:  t.InputSchema,
+			OutputSchema: outputSchema,
+			Annotations:  t.Annotations,
 		})
 	}
 	return out

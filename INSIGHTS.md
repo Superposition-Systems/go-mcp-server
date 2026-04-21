@@ -337,3 +337,28 @@ _2026-04-17 16:08_
 - The authorize-POST `GetClient` log keeps `sql.ErrNoRows` (unlike authorize-GET) because at that point the client_id came from `auth_requests` — a table we just wrote 10s ago. "Row disappeared" there means either someone is racing deletion or the DB is unhappy, both of which operators want to see.
 - `AuthPath` is a named `string` type, not a raw `string`. This gives callers a compile-time error if they pass a typo'd literal into `GetAuthPath`'s comparand — the common footgun when context values are stringly-typed.
 `─────────────────────────────────────────────────`
+---
+_2026-04-17 16:10_
+
+`★ Insight ─────────────────────────────────────`
+- Chose `v0.8.3` (patch) over `v0.9.0` (minor) even though `AuthPath` adds new exported API. The project's own history justifies it: `v0.8.2` added `suggest.EventEnvelopeAlias` (new exported constant) as a patch bump, and `v0.8.1` added behavior (alias acceptance) as a patch. Consistency with the project's working convention beats a strict semver reading — `v0.9.0` would have implied a bigger release than this actually is.
+- For Go libraries, the push IS the release — `proxy.golang.org` will serve `v0.8.3` to any consumer that requests it within minutes. No build pipeline, no deploy step; the tag is the artifact. (Noted in INSIGHTS.md from an earlier session — the pattern has held across five+ releases now.)
+`─────────────────────────────────────────────────`
+---
+_2026-04-21 16:15_
+
+`★ Insight ─────────────────────────────────────`
+Two structural facts shape this audit: (1) the protocol version is a bare `const protocolVersion = "2025-03-26"` in `transport.go:13` — the server never even reads the client's requested version from `initialize`, it just asserts its own. That's actually a *pre-existing* spec ambiguity, not just a "we're behind" — a 2025-06-18 client gets its requested version silently ignored. (2) The `initialize` response advertises `capabilities: {tools: {listChanged: false}}` and nothing else (`transport.go:193`), which means every question about "should we add sampling/elicitation/completions?" is really "should we advertise *any* server-side capability beyond tools?" — today we don't.
+`─────────────────────────────────────────────────`
+---
+_2026-04-21 16:28_
+
+`★ Insight ─────────────────────────────────────`
+The test at `transport_test.go:104` now asserts against `supportedProtocolVersions[0]` rather than a string literal. That decision trades a little readability for a lot of resilience: every future version bump needs only one line changed (prepend to the slice) and every test that asserts "default advertised" stays green. Locking in a literal here would make future bumps a multi-test chore.
+`─────────────────────────────────────────────────`
+---
+_2026-04-21 16:55_
+
+`★ Insight ─────────────────────────────────────`
+Two subtle correctness choices worth noting: (1) `tr.IsError` takes precedence over the outer `Call`-level `isError` bool, but only in the *raise* direction — a middleware that forces `isError=true` still wins even if the consumer's `*ToolResult.IsError` is false. That asymmetry matters because middleware-set error state usually means "something the consumer didn't know went wrong upstream" and shouldn't be maskable. (2) An empty `content: []` is emitted rather than omitted when the consumer returns a `*ToolResult` with neither field set — spec says `content` is required. Returning a truly minimal `*ToolResult{}` is almost certainly a consumer bug, but the library holds the spec line rather than escalating to `isError` on their behalf.
+`─────────────────────────────────────────────────`

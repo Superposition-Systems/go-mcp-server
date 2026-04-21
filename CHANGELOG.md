@@ -5,6 +5,164 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.9.0] — 2026-04-21
+
+MCP 2025-06-18 spec uptake — targeted, additive. Three spec deltas that
+map to real consumer value: protocol-version negotiation, structured
+tool output, and RFC 8707 Resource Indicators. Explicitly skipped:
+sampling, elicitation, completions — none of the existing consumers
+(`apple-notes-manager`, `claude-log-archive`, `vps-mcp`, `traxos-mcp-go`)
+have a handler that would use them today.
+
+**Zero breaking changes to the public Go API.** Every consumer keeps
+compiling and the behaviour of every call site that existed in v0.8 is
+byte-identical unless the consumer opts into the new pathway.
+
+### Added — protocol-version negotiation (`transport.go`)
+
+- **Per-request version negotiation in `initialize`.** The server now
+  parses the client's `protocolVersion` param and echoes it verbatim
+  when supported; an unsupported or empty value falls back to the
+  newest supported (`2025-06-18`), matching the spec's "server-
+  authoritative handshake, prefer latest" rule. Pre-v0.9 the server
+  hard-coded `2025-03-26` regardless of what the client sent.
+- **`MCP-Protocol-Version` HTTP header** validated on every
+  post-initialize request. Absent header → tolerated (legacy 2025-03-26
+  client); present but unsupported → rejected with JSON-RPC `-32600`.
+  `initialize` itself is exempt because the client cannot know the
+  server's supported versions until it has replied.
+- `supportedProtocolVersions` slice is the single source of truth for
+  advertised versions and header validation.
+
+### Added — structured tool output (`types.go`, `transport.go`)
+
+- **`OutputSchema` field on `ToolDef` and `Tool`.** Optional; the field
+  is `omitempty` and bumps the `tools/list` wire shape to include the
+  declared output schema when set. Existing tool definitions emit
+  byte-identical `tools/list` output.
+- **`*ToolResult` return type** for `ToolHandler.Call` — an optional
+  wrapper that lets a consumer emit a 2025-06-18 `structuredContent`
+  block alongside (or instead of) the legacy text content. Returning
+  any non-`*ToolResult` value preserves the pre-v0.9 marshal-to-text
+  behaviour exactly. Spec §Tools/Backwards Compatibility is honoured:
+  when the consumer provides only `StructuredContent`, the transport
+  synthesizes a text content block from the JSON-marshaled payload so
+  clients that don't understand structured output still render
+  something.
+- **`ContentBlock` type alias + `TextContent()` helper** for
+  constructing content blocks inline without reaching for
+  `map[string]any` literals.
+- **Response-transformer bypass** for `*ToolResult` — a consumer that
+  returns an explicit structured shape is not silently rewritten by
+  `CompactResponse` or any other `ResponseTransformer`.
+
+### Added — RFC 8707 Resource Indicators (`auth/oauth.go`, `auth/store.go`, `auth/middleware.go`)
+
+- **Full OAuth audience binding.** The `/authorize` and `/token`
+  endpoints accept an RFC 8707 `resource` parameter; when supplied it
+  is validated against the server's canonical resource URI
+  (`ExternalURL + ResourcePath`) and persisted onto the issued access
+  and refresh tokens. The refresh flow inherits the audience — a token
+  originally issued for resource A cannot be rotated into a token for
+  resource B.
+- **`BearerMiddlewareForResource(...)`** — audience-aware variant of
+  `BearerMiddleware`. The existing `BearerMiddleware` call shape is
+  preserved; it now delegates to the new function with
+  `expectedResource=""` (no enforcement).
+- **`WithRequireResourceIndicator()` option** mandates that every
+  authorization/token request include a matching `resource` parameter.
+  Leave unset during the transition; the server still validates
+  present values and binds audience automatically as clients upgrade.
+- **`resource_indicators_supported: true`** advertised in OAuth
+  discovery metadata.
+- **Asymmetric accept-empty policy** in the audience comparison:
+  stored-empty tokens (pre-v0.9) are accepted by enforcing servers,
+  and audience-bound tokens are accepted by non-enforcing servers
+  (including legacy `BearerMiddleware` callers). The only rejection
+  cell is `stored=X ∧ expected=Y ∧ X≠Y` — the actual RFC 8707 threat.
+  This asymmetry is what makes the v0.8→v0.9 upgrade safe for tokens
+  already in flight.
+
+### Added — SQLite schema v1 → v2 migration (`auth/store.go`)
+
+- `schema_version` checkpoint (landed in v0.8.3) now does real work:
+  `initSchemaVersion` runs forward migrations from the current version
+  up to `currentSchemaVersion` (now `2`). The `migrations` map is the
+  single source of truth for all schema changes at v2+; `createTables`
+  stays at v1 shape so the migration path is authoritative.
+- Migration adds `resource` (to `auth_requests`, `auth_codes`) and
+  `audience` (to `access_tokens`, `refresh_tokens`) columns.
+  `ALTER TABLE ADD COLUMN` is O(1) in SQLite (metadata-only); safe on
+  large token tables.
+- `AuthCodeData.Resource` and `TokenData.Audience` struct fields added.
+- New `VerifyAccessTokenForResource(token, scope, expectedResource)`
+  alongside existing `VerifyAccessToken` (unchanged — audience-agnostic
+  for backwards compat).
+
+### Changed
+
+- **Default advertised protocol version bumps to `2025-06-18`** for
+  clients that don't specify. Clients that explicitly request
+  `2025-03-26` continue to get it echoed verbatim — no forced upgrade.
+
+### Removed
+
+- `SECURITY_AUDIT_2026-04-14.md` — the findings landed in v0.7.4
+  (see H-1, M-1, M-2, M-3, M-4 entries below). The doc had served its
+  purpose as a decision record and was becoming misleading as an
+  apparent open to-do list.
+
+### Dependencies
+
+Housekeeping bumps (no library-API effect):
+
+- `modernc.org/sqlite`         v1.48.1 → v1.49.1
+- `modernc.org/libc`           v1.70.0 → v1.72.0
+- `golang.org/x/text`          v0.14.0 → v0.36.0
+- `golang.org/x/sys`           v0.42.0 → v0.43.0
+- `github.com/mattn/go-isatty` v0.0.20 → v0.0.21
+
+### Tests
+
+18 new tests across `transport_test.go` and
+`auth/resource_indicator_test.go`:
+
+- Protocol negotiation: client-supported / unsupported / empty →
+  correct echo, plus `MCP-Protocol-Version` header accept/reject
+  matrix.
+- Structured content: explicit content + structured / structured only
+  (synthesize text) / content only (omit structuredContent) / IsError
+  on `*ToolResult`; absence of `outputSchema` on `tools/list` when
+  unset (the typed-nil pitfall guard).
+- RFC 8707: full 5-cell stored × expected audience matrix; 8-cell
+  `validateResourceParam` policy matrix (lenient/strict ×
+  omit/canonical/wrong/multi × ExternalURL/no-ExternalURL); token
+  exchange binds audience and rejects wrong resource; refresh inherits
+  audience; bearer rejects wrong-audience token at the wire; v1 → v2
+  migration preserves legacy token verification and bumps
+  `schema_version`.
+
+### Known scope limitation
+
+- The mux `<prefix>_execute` dispatcher does not propagate an inner
+  tool's `*ToolResult` through its own return shape — the mux wraps
+  results into its own envelope. Consumers using the mux pattern who
+  want structured output for a dispatched tool will need bespoke
+  forwarding. None of the current consumers are affected.
+
+### Migration notes for consumers
+
+- **Just bump `go-mcp-server` in `go.mod`** — existing code compiles
+  unchanged.
+- **Opt into structured output** by changing a tool's `Handler` to
+  return `*mcpserver.ToolResult{StructuredContent: ...}` and (if
+  desired) setting `OutputSchema` on its `Tool`/`ToolDef`.
+- **Opt into strict RFC 8707** via `mcpserver.WithRequireResourceIndicator()`
+  once every client in your deployment is known to send the `resource`
+  parameter. Check for `invalid_target` entries in your logs before
+  flipping the flag.
+- **SQLite DB** auto-migrates on first v0.9 open. No manual step.
+
 ## [v0.8.3] — 2026-04-17
 
 ### Fixed

@@ -98,8 +98,12 @@ func TestInitialize(t *testing.T) {
 		t.Fatal("result is not a map")
 	}
 
-	if result["protocolVersion"] != protocolVersion {
-		t.Errorf("expected protocolVersion %q, got %q", protocolVersion, result["protocolVersion"])
+	// When the client sends no protocolVersion, the server echoes its
+	// newest supported version (supportedProtocolVersions[0]). This
+	// asserts the default-advertised version rather than pinning a
+	// specific literal so version bumps only need to update the slice.
+	if result["protocolVersion"] != supportedProtocolVersions[0] {
+		t.Errorf("expected protocolVersion %q, got %q", supportedProtocolVersions[0], result["protocolVersion"])
 	}
 
 	serverInfo, ok := result["serverInfo"].(map[string]any)
@@ -114,6 +118,91 @@ func TestInitialize(t *testing.T) {
 	}
 	if result["instructions"] != "A test server" {
 		t.Errorf("expected instructions, got %v", result["instructions"])
+	}
+}
+
+// TestInitializeProtocolVersionNegotiation covers the three branches of
+// negotiateProtocolVersion: exact support (echo verbatim), unsupported
+// (fall back to newest), and backwards-compat for the old pinned
+// constant. These are protocol-boundary assertions — a regression here
+// is a spec-conformance regression, not a local bug.
+func TestInitializeProtocolVersionNegotiation(t *testing.T) {
+	handler, _ := newTestHandler()
+
+	cases := []struct {
+		name      string
+		requested string
+		want      string
+	}{
+		{"newest supported echoed verbatim", protocolVersion20250618, protocolVersion20250618},
+		{"older supported echoed verbatim", protocolVersion20250326, protocolVersion20250326},
+		{"unsupported falls back to newest", "2024-11-05", protocolVersion20250618},
+		{"empty falls back to newest", "", protocolVersion20250618},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			params := map[string]any{}
+			if tc.requested != "" {
+				params["protocolVersion"] = tc.requested
+			}
+			rec := doPost(handler, "initialize", params)
+			resp := parseSSEResponse(t, rec.Body.String())
+			if resp.Error != nil {
+				t.Fatalf("unexpected error: %v", resp.Error)
+			}
+			result := resp.Result.(map[string]any)
+			if result["protocolVersion"] != tc.want {
+				t.Errorf("requested %q: expected protocolVersion %q, got %q", tc.requested, tc.want, result["protocolVersion"])
+			}
+		})
+	}
+}
+
+// TestMCPProtocolVersionHeader covers the post-initialize header
+// validation: supported values pass through, unsupported values are
+// rejected with JSON-RPC -32600, and absence is tolerated (legacy
+// 2025-03-26 clients never send the header).
+func TestMCPProtocolVersionHeader(t *testing.T) {
+	handler, _ := newTestHandler()
+
+	build := func(protocolVer string) *http.Request {
+		body := JSONRPCRequest{JSONRPC: "2.0", ID: 1, Method: "tools/list"}
+		data, _ := json.Marshal(body)
+		req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(data))
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("Content-Type", "application/json")
+		if protocolVer != "" {
+			req.Header.Set(mcpProtocolVersionHeader, protocolVer)
+		}
+		return req
+	}
+
+	cases := []struct {
+		name    string
+		header  string
+		wantErr bool
+	}{
+		{"absent header is tolerated (legacy client)", "", false},
+		{"supported 2025-06-18 header accepted", protocolVersion20250618, false},
+		{"supported 2025-03-26 header accepted", protocolVersion20250326, false},
+		{"unsupported header rejected", "2024-11-05", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			handler(rec, build(tc.header))
+			resp := parseSSEResponse(t, rec.Body.String())
+			if tc.wantErr {
+				if resp.Error == nil {
+					t.Fatalf("expected JSON-RPC error, got success")
+				}
+				if resp.Error.Code != -32600 {
+					t.Errorf("expected code -32600, got %d", resp.Error.Code)
+				}
+			} else if resp.Error != nil {
+				t.Errorf("unexpected error: %v", resp.Error)
+			}
+		})
 	}
 }
 
@@ -173,6 +262,125 @@ func TestToolsCall(t *testing.T) {
 	}
 	if parsed["message"] != "hello" {
 		t.Errorf("expected message 'hello', got %v", parsed["message"])
+	}
+}
+
+// TestToolsCallStructuredContent exercises the *ToolResult opt-in path
+// introduced in v0.9 for the 2025-06-18 structured-content capability.
+// The four sub-tests together assert:
+//
+//   - structured + explicit content → both fields present, unchanged
+//   - structured only → text content is synthesized from the structured
+//     payload so legacy clients still render (spec §Tools/Backcompat)
+//   - explicit content only → structuredContent field omitted entirely
+//     (not "null"; clients MUST be able to distinguish absent from null)
+//   - IsError on *ToolResult → response isError reflects it even when
+//     the outer Call bool is false
+//
+// Regressions here are protocol-boundary; the synthesize-text behaviour
+// in particular is what keeps 2025-03-26 clients working after a
+// consumer adopts structured output.
+func TestToolsCallStructuredContent(t *testing.T) {
+	mock := &mockToolHandler{
+		tools: []ToolDef{{Name: "echo", Description: "", InputSchema: map[string]any{"type": "object"}}},
+	}
+	info := ServerInfo{Name: "test", Version: "1.0.0"}
+	handler := TransportHandler(info, mock)
+
+	t.Run("structured plus explicit content", func(t *testing.T) {
+		mock.callFn = func(context.Context, string, map[string]any) (any, bool) {
+			return &ToolResult{
+				StructuredContent: map[string]any{"result": 42},
+				Content:           []ContentBlock{TextContent("human-readable summary")},
+			}, false
+		}
+		rec := doPost(handler, "tools/call", map[string]any{"name": "echo", "arguments": map[string]any{}})
+		resp := parseSSEResponse(t, rec.Body.String())
+		result := resp.Result.(map[string]any)
+
+		sc, ok := result["structuredContent"].(map[string]any)
+		if !ok || sc["result"] != float64(42) {
+			t.Errorf("expected structuredContent.result=42, got %v", result["structuredContent"])
+		}
+		content := result["content"].([]any)
+		if first := content[0].(map[string]any); first["text"] != "human-readable summary" {
+			t.Errorf("expected consumer-supplied text, got %v", first["text"])
+		}
+	})
+
+	t.Run("structured only synthesizes text", func(t *testing.T) {
+		mock.callFn = func(context.Context, string, map[string]any) (any, bool) {
+			return &ToolResult{StructuredContent: map[string]any{"x": "y"}}, false
+		}
+		rec := doPost(handler, "tools/call", map[string]any{"name": "echo", "arguments": map[string]any{}})
+		resp := parseSSEResponse(t, rec.Body.String())
+		result := resp.Result.(map[string]any)
+
+		content := result["content"].([]any)
+		if len(content) != 1 {
+			t.Fatalf("expected 1 synthesized content block, got %d", len(content))
+		}
+		first := content[0].(map[string]any)
+		if first["type"] != "text" {
+			t.Errorf("expected synthesized block type 'text', got %v", first["type"])
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(first["text"].(string)), &parsed); err != nil {
+			t.Fatalf("synthesized text is not valid JSON: %v", err)
+		}
+		if parsed["x"] != "y" {
+			t.Errorf("expected synthesized text to contain structured payload, got %v", parsed)
+		}
+	})
+
+	t.Run("content only omits structuredContent field", func(t *testing.T) {
+		mock.callFn = func(context.Context, string, map[string]any) (any, bool) {
+			return &ToolResult{Content: []ContentBlock{TextContent("plain")}}, false
+		}
+		rec := doPost(handler, "tools/call", map[string]any{"name": "echo", "arguments": map[string]any{}})
+		resp := parseSSEResponse(t, rec.Body.String())
+		result := resp.Result.(map[string]any)
+
+		if _, present := result["structuredContent"]; present {
+			t.Error("structuredContent must be absent (not null) when consumer provides content only")
+		}
+	})
+
+	t.Run("IsError on ToolResult surfaces", func(t *testing.T) {
+		mock.callFn = func(context.Context, string, map[string]any) (any, bool) {
+			return &ToolResult{
+				StructuredContent: map[string]any{"err": "bad input"},
+				IsError:           true,
+			}, false // outer bool is false — ToolResult.IsError must win
+		}
+		rec := doPost(handler, "tools/call", map[string]any{"name": "echo", "arguments": map[string]any{}})
+		resp := parseSSEResponse(t, rec.Body.String())
+		result := resp.Result.(map[string]any)
+
+		if result["isError"] != true {
+			t.Errorf("expected isError=true from ToolResult.IsError, got %v", result["isError"])
+		}
+	})
+}
+
+// TestToolsListOutputSchemaAbsentWhenUnset pins the wire-level omission of
+// OutputSchema for tools that don't declare one. This is the
+// backwards-compat guarantee: an existing consumer that compiles against
+// v0.9 without changing its tool definitions produces the exact same
+// tools/list bytes as before. The typed-nil pitfall in registry.go —
+// where a nil json.RawMessage wrapped in `any` would marshal to `null`
+// instead of being absent — is what this test is actually defending.
+func TestToolsListOutputSchemaAbsentWhenUnset(t *testing.T) {
+	handler, _ := newTestHandler()
+	rec := doPost(handler, "tools/list", nil)
+	resp := parseSSEResponse(t, rec.Body.String())
+	result := resp.Result.(map[string]any)
+	tools := result["tools"].([]any)
+	for _, raw := range tools {
+		tool := raw.(map[string]any)
+		if _, present := tool["outputSchema"]; present {
+			t.Errorf("tool %q: outputSchema should be absent when unset, got %v", tool["name"], tool["outputSchema"])
+		}
 	}
 }
 

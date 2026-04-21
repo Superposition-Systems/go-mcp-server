@@ -10,7 +10,55 @@ import (
 	"strings"
 )
 
-const protocolVersion = "2025-03-26"
+// Protocol versions this server implements. Listed newest-first — order
+// is load-bearing because negotiateProtocolVersion falls back to
+// supportedProtocolVersions[0] when the client requests something we
+// don't support, matching the spec's "prefer the latest supported
+// version" guidance.
+const (
+	protocolVersion20250618 = "2025-06-18"
+	protocolVersion20250326 = "2025-03-26"
+
+	// mcpProtocolVersionHeader is the HTTP header introduced in 2025-06-18
+	// for the client to declare the negotiated version on every
+	// post-initialize request. A 2025-03-26 client does not send it; we
+	// treat absence as legacy/backcompat rather than an error.
+	mcpProtocolVersionHeader = "MCP-Protocol-Version"
+)
+
+var supportedProtocolVersions = []string{
+	protocolVersion20250618,
+	protocolVersion20250326,
+}
+
+// protocolVersion is retained as the "default advertised version" for
+// callers (including tests) that want a single value to reason about.
+// New code should prefer negotiateProtocolVersion to respect the client's
+// requested version.
+const protocolVersion = protocolVersion20250326
+
+func isSupportedProtocolVersion(v string) bool {
+	for _, s := range supportedProtocolVersions {
+		if s == v {
+			return true
+		}
+	}
+	return false
+}
+
+// negotiateProtocolVersion implements §Initialization of the MCP spec:
+// echo the client's requested version verbatim when supported, otherwise
+// return our newest supported version. An empty requested string falls
+// into the "not supported" branch — the MCP spec has required a
+// protocolVersion in initialize params since 2024-11-05, so empty is
+// either a malformed client or a pre-spec probe; either way, advertising
+// our newest supported version is the correct response.
+func negotiateProtocolVersion(requested string) string {
+	if isSupportedProtocolVersion(requested) {
+		return requested
+	}
+	return supportedProtocolVersions[0]
+}
 
 // TransportHandler returns an http.HandlerFunc for the MCP endpoint.
 // It handles JSON-RPC 2.0 requests over HTTP with SSE responses.
@@ -160,6 +208,24 @@ func handlePost(w http.ResponseWriter, r *http.Request, info ServerInfo, tools T
 		return
 	}
 
+	// MCP-Protocol-Version header, introduced in 2025-06-18, is required
+	// on every post-initialize request by that spec revision. We validate
+	// only when the header is present — absence is how a 2025-03-26
+	// client still looks on the wire, and rejecting those would break
+	// backwards compatibility for no spec-compliance gain. `initialize`
+	// itself is exempt because that's where negotiation happens; the
+	// client cannot know the server's supported versions until we reply.
+	if req.Method != "initialize" {
+		if v := r.Header.Get(mcpProtocolVersionHeader); v != "" && !isSupportedProtocolVersion(v) {
+			writeSSE(w, JSONRPCResponse{
+				JSONRPC: "2.0",
+				ID:      req.ID,
+				Error:   &RPCError{Code: -32600, Message: "Unsupported MCP-Protocol-Version: " + v},
+			})
+			return
+		}
+	}
+
 	switch req.Method {
 	case "initialize":
 		handleInitialize(w, req, info)
@@ -185,11 +251,23 @@ func handlePost(w http.ResponseWriter, r *http.Request, info ServerInfo, tools T
 }
 
 func handleInitialize(w http.ResponseWriter, req JSONRPCRequest, info ServerInfo) {
+	// Parse the client's requested protocolVersion from params. A decode
+	// failure is not fatal — we fall through to negotiateProtocolVersion
+	// with an empty string, which picks our newest supported version.
+	// This is safer than returning a JSON-RPC error for a params shape we
+	// only partly care about; the rest of initialize ignores extra fields.
+	var p struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if len(req.Params) > 0 {
+		_ = json.Unmarshal(req.Params, &p)
+	}
+
 	writeSSE(w, JSONRPCResponse{
 		JSONRPC: "2.0",
 		ID:      req.ID,
 		Result: map[string]any{
-			"protocolVersion": protocolVersion,
+			"protocolVersion": negotiateProtocolVersion(p.ProtocolVersion),
 			"capabilities": map[string]any{
 				"tools": map[string]any{"listChanged": false},
 			},
@@ -248,36 +326,87 @@ func handleToolsCall(w http.ResponseWriter, r *http.Request, req JSONRPCRequest,
 	// the caller should treat err as protocol-external; we fold it into
 	// the MCP isError envelope rather than a JSON-RPC error so the
 	// downstream client sees a tool failure, not a transport failure.
-	var text string
 	if callErr != nil {
-		isError = true
-		text = callErr.Error()
-	} else {
-		marshaled, marshalErr := marshalResult(result)
-		if marshalErr != nil {
-			// Log server-side: on the wire this is indistinguishable from a
-			// tool-level error (both isError=true), so without this line an
-			// operator cannot tell a marshal bug from a genuine failing tool
-			// — callErr != nil is a tool-level error, marshalErr != nil is a
-			// library-level serialisation bug that deserves an alert.
-			log.Printf("mcpserver: marshal tool %q result: %v", params.Name, marshalErr)
-			isError = true
-		}
-		text = marshaled
+		writeSSE(w, JSONRPCResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Result: map[string]any{
+				"content": []map[string]any{{"type": "text", "text": callErr.Error()}},
+				"isError": true,
+			},
+		})
+		return
 	}
 
-	content := []map[string]any{
-		{"type": "text", "text": text},
+	// Structured-content opt-in path (2025-06-18). A consumer returns
+	// *ToolResult to emit a `structuredContent` field and/or an explicit
+	// content-block list. Returning any other value falls through to the
+	// legacy marshal-to-text path below, which preserves the pre-v0.9
+	// wire shape exactly — existing consumers compile and run unchanged.
+	if tr, ok := result.(*ToolResult); ok && tr != nil {
+		writeSSE(w, buildStructuredResponse(req.ID, params.Name, tr, isError))
+		return
+	}
+
+	marshaled, marshalErr := marshalResult(result)
+	if marshalErr != nil {
+		// Log server-side: on the wire this is indistinguishable from a
+		// tool-level error (both isError=true), so without this line an
+		// operator cannot tell a marshal bug from a genuine failing tool
+		// — callErr != nil is a tool-level error, marshalErr != nil is a
+		// library-level serialisation bug that deserves an alert.
+		log.Printf("mcpserver: marshal tool %q result: %v", params.Name, marshalErr)
+		isError = true
 	}
 
 	writeSSE(w, JSONRPCResponse{
 		JSONRPC: "2.0",
 		ID:      req.ID,
 		Result: map[string]any{
-			"content": content,
+			"content": []map[string]any{{"type": "text", "text": marshaled}},
 			"isError": isError,
 		},
 	})
+}
+
+// buildStructuredResponse constructs the tools/call JSON-RPC response for
+// a consumer that opted in by returning *ToolResult. It honours the
+// 2025-06-18 spec's §Tools/Backwards Compatibility guidance: a text
+// content fallback is always synthesized from StructuredContent when the
+// consumer didn't provide one, so clients that don't yet understand
+// structuredContent still render something reasonable.
+//
+// The fallbackIsErr parameter is the isError bool returned alongside the
+// *ToolResult from Call; tr.IsError takes precedence (consumer-declared
+// intent wins over the outer bool) but fallbackIsErr still fires if it's
+// true, so a middleware that forces isError can't be silently dropped by
+// a consumer that left tr.IsError as the zero value.
+func buildStructuredResponse(id any, toolName string, tr *ToolResult, fallbackIsErr bool) JSONRPCResponse {
+	content := tr.Content
+	if len(content) == 0 && tr.StructuredContent != nil {
+		b, err := json.Marshal(tr.StructuredContent)
+		if err != nil {
+			log.Printf("mcpserver: marshal tool %q structured content: %v", toolName, err)
+			content = []ContentBlock{TextContent("error: failed to marshal structured content")}
+		} else {
+			content = []ContentBlock{TextContent(string(b))}
+		}
+	}
+	if content == nil {
+		// Spec says content is REQUIRED; an empty array is valid and
+		// distinct from `null`. A consumer returning an empty ToolResult
+		// is probably a bug but not one we should escalate to isError.
+		content = []ContentBlock{}
+	}
+
+	resultMap := map[string]any{
+		"content": content,
+		"isError": tr.IsError || fallbackIsErr,
+	}
+	if tr.StructuredContent != nil {
+		resultMap["structuredContent"] = tr.StructuredContent
+	}
+	return JSONRPCResponse{JSONRPC: "2.0", ID: id, Result: resultMap}
 }
 
 // writeSSE writes a single SSE event with the JSON-RPC response.

@@ -312,8 +312,14 @@ func (s *Server) ListenAndServe() error {
 		afterAuth = s.elevation.Middleware()(inner)
 	}
 
-	var handler http.Handler = auth.BearerMiddleware(
-		s.bearerToken, s.tokenValidator, oauthStore, s.oauthConfig.Scope, s.mcpPath,
+	// Pass the server's canonical resource URI into bearer auth so
+	// OAuth tokens issued with an RFC 8707 audience binding are
+	// enforced on incoming requests. An empty expectedResource (server
+	// without ExternalURL — typical local dev) disables enforcement
+	// without breaking pre-v0.9 tokens that have no audience recorded.
+	var handler http.Handler = auth.BearerMiddlewareForResource(
+		s.bearerToken, s.tokenValidator, oauthStore, s.oauthConfig.Scope,
+		oauthHandler.CanonicalResource(), s.mcpPath,
 	)(afterAuth)
 
 	// Apply outer middleware (e.g. auth scope tagging) — runs before bearer auth

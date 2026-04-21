@@ -55,7 +55,14 @@ func responseTransformerMiddleware(t ResponseTransformer) ToolMiddleware {
 		return func(ctx context.Context, name string, args map[string]any) (any, bool, error) {
 			result, isError, err := next(ctx, name, args)
 			if err == nil && !isError && result != nil {
-				result = t(name, result)
+				// A consumer returning *ToolResult has opted in to
+				// structured output and chosen the exact content/
+				// structuredContent shape — running a CompactResponse
+				// or similar transformer over that would mutate data
+				// the consumer explicitly controlled. Bypass.
+				if _, structured := result.(*ToolResult); !structured {
+					result = t(name, result)
+				}
 			}
 			return result, isError, err
 		}

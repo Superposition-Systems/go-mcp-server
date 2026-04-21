@@ -113,10 +113,11 @@ type ToolHandler interface {
 }
 
 type ToolDef struct {
-    Name        string           `json:"name"`
-    Description string           `json:"description"`
-    InputSchema any              `json:"inputSchema"`
-    Annotations *ToolAnnotations `json:"annotations,omitempty"`
+    Name         string           `json:"name"`
+    Description  string           `json:"description"`
+    InputSchema  any              `json:"inputSchema"`
+    OutputSchema any              `json:"outputSchema,omitempty"`
+    Annotations  *ToolAnnotations `json:"annotations,omitempty"`
 }
 
 type ToolAnnotations struct {
@@ -130,6 +131,24 @@ type ToolAnnotations struct {
 `ListTools()` returns MCP tool definitions (including JSON Schema for arguments). `Call()` dispatches tool invocations by name. Return `isError: true` to signal a tool-level error to the client.
 
 `Annotations` carries optional [MCP tool annotation hints](https://modelcontextprotocol.io/specification/2025-03-26/server/tools#annotations) that describe a tool's side-effect profile. All fields are `*bool` — `nil` means "unspecified" (omitted from the wire), while `&false` explicitly declares the hint as false. Use `BoolPtr(v)` for inline construction. When set on a `Tool` in the Registry, annotations flow through to the `tools/list` response and the mux `list_tools` output automatically.
+
+### Structured tool output (2025-06-18)
+
+`OutputSchema` on a `ToolDef` (or `Tool` in the Registry) is optional. When set, it flows through to the `tools/list` response as the `outputSchema` field per the 2025-06-18 spec. When unset, the field is absent from the wire — existing tool definitions produce byte-identical `tools/list` output.
+
+To emit a `structuredContent` block alongside the legacy text content, return `*mcpserver.ToolResult` from `Call`:
+
+```go
+func (h *MyHandler) Call(ctx context.Context, name string, args map[string]any) (any, bool) {
+    data := runTool(args)
+    return &mcpserver.ToolResult{
+        StructuredContent: data,                                      // emitted as result.structuredContent
+        Content:           []mcpserver.ContentBlock{mcpserver.TextContent("Completed")}, // optional human-readable summary
+    }, false
+}
+```
+
+Returning anything else (plain map, struct, error envelope) preserves the pre-v0.9 behaviour: the value is JSON-marshaled into a single text content block. If `Content` is omitted on the `ToolResult`, the transport synthesizes a text block from `StructuredContent` so clients that don't yet understand structured output still render something useful.
 
 For servers with more than a handful of tools, the [Registry](#extension-layer-v080) added in v0.8.0 is usually a nicer fit than implementing this interface directly — each tool is a self-describing struct with category, alias, annotation, and schema metadata, and `Registry.AsToolHandler()` produces the same interface.
 
@@ -158,6 +177,7 @@ All options are passed to `New()`:
 | `WithAllowedOrigins(...)` | `nil` | Browser `Origin` allowlist; non-matching requests get 403. Mitigates DNS-rebinding on SSE endpoints. |
 | `WithTrustedProxyCIDRs(...)` | `nil` | CIDR ranges whose `X-Forwarded-For` / `X-Real-IP` the server may trust for rate-limiting keys. |
 | `WithAllowMissingState()` | `false` | Legacy opt-out — permits OAuth `/authorize` without the `state` parameter. Not recommended. |
+| `WithRequireResourceIndicator()` | `false` | Requires every `/authorize` and `/token` request to carry an RFC 8707 `resource` parameter matching the server's canonical URI. The 2025-06-18 MCP spec mandates it client-side; flip this on once every client is known to send it. Audience binding still works when left off — the server validates the parameter whenever it's present. |
 | `WithElevation(cfg)` | `nil` | Enables step-up-auth elevation (see [Elevation](#elevation)) |
 | `WithToolMiddleware(mw...)` | `nil` | Installs one or more tool-call middlewares; outermost-first (see [Extension layer](#extension-layer-v080)) |
 | `WithResponseTransformer(t)` | `nil` | Installs a tool-response transformer (e.g. `CompactREST()` for REST-envelope stripping) |
@@ -235,6 +255,7 @@ Client                          Server                          User
 - Auth request parameters stored server-side (not in browser forms).
 - The PIN consent page displays the registered `client_name` and the `redirect_uri` host so the operator can visually confirm *who* they are authorizing. Without this, a DCR-registered client with an attacker-controlled redirect URI would be visually indistinguishable from a legitimate one.
 - `POST /revoke` (RFC 7009) removes a presented access or refresh token from the store. Authenticates the client with `client_secret_post` and silently succeeds on unknown tokens (RFC-mandated, prevents probing). Store failures surface as `503` rather than a quiet `200` so operators know the revocation did not take effect.
+- **RFC 8707 Resource Indicators (2025-06-18):** `/authorize` and `/token` accept a `resource` parameter identifying the MCP server the token is for. When present, the value is validated against the canonical URI (`ExternalURL + MCPPath`) and bound to the issued access + refresh tokens as an audience. `BearerMiddleware` rejects a token whose bound audience doesn't match the server it arrives at — a token issued for server A cannot be replayed against server B. Legacy tokens (no audience recorded) keep working; enable `WithRequireResourceIndicator()` to additionally require the parameter on every request once all clients are known to send it. Advertised in OAuth discovery as `resource_indicators_supported: true`.
 
 ### Bearer Middleware
 
@@ -490,7 +511,7 @@ The MCP transport uses JSON-RPC 2.0 over HTTP with Server-Sent Events (SSE) resp
 
 | Method | Description |
 |--------|-------------|
-| `initialize` | Returns server info, capabilities, protocol version (`2025-03-26`) |
+| `initialize` | Negotiates protocol version (supports `2025-03-26` and `2025-06-18`; echoes the client's requested version when supported, else the newest supported), returns server info and capabilities |
 | `tools/list` | Returns tool definitions from `ToolHandler.ListTools()` |
 | `tools/call` | Dispatches to `ToolHandler.Call()` |
 | `ping` | Returns empty result (health check) |

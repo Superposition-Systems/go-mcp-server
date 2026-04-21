@@ -56,19 +56,36 @@ type ClientData struct {
 }
 
 // AuthCodeData represents an issued authorization code.
+//
+// Resource, when non-empty, is the RFC 8707 Resource Indicator the
+// client requested at /authorize. It must be re-asserted at /token
+// exchange (same value or a subset per RFC 8707 §2.2); a mismatch is
+// rejected with `invalid_target`. An empty Resource indicates the
+// client did not request an indicator — the token issued from this
+// code will carry an empty Audience and is accepted by any
+// audience-tolerant middleware (the pre-v0.9 behaviour).
 type AuthCodeData struct {
 	ClientID            string
 	RedirectURI         string
 	CodeChallenge       string
 	CodeChallengeMethod string
 	Scope               string
+	Resource            string
 	CreatedAt           int64
 }
 
 // TokenData represents an access or refresh token.
+//
+// Audience, when non-empty, is the RFC 8707 canonical resource the
+// token was issued for (derived from the validated `resource` param at
+// /token exchange). BearerMiddleware enforces this on incoming
+// requests: a token with a non-empty Audience is rejected if the
+// server's canonical resource doesn't match. An empty Audience
+// preserves the pre-v0.9 "any resource" behaviour.
 type TokenData struct {
 	ClientID  string
 	Scope     string
+	Audience  string
 	ExpiresAt int64
 	CreatedAt int64
 }
@@ -207,6 +224,11 @@ func (s *OAuthStore) createTables() error {
 			scope TEXT DEFAULT '',
 			created_at INTEGER NOT NULL
 		);
+		-- Note: createTables describes the v1 table shape. All schema
+		-- changes at v2 and beyond live exclusively in the migrations
+		-- map so a single code path is authoritative — fresh DBs get
+		-- v1 shape here, then the migration loop in initSchemaVersion
+		-- brings them up to currentSchemaVersion via ALTER TABLE.
 		-- Indexes on the columns Cleanup scans, so the periodic
 		-- DELETE-WHERE does not degrade to a full table scan at cap.
 		CREATE INDEX IF NOT EXISTS idx_auth_codes_created_at     ON auth_codes(created_at);
@@ -228,23 +250,83 @@ func (s *OAuthStore) createTables() error {
 	return s.initSchemaVersion()
 }
 
-// currentSchemaVersion is the schema revision written into schema_version
-// on fresh databases. Bump in lockstep with any change to createTables.
-const currentSchemaVersion = 1
+// currentSchemaVersion is the schema revision the library expects after
+// createTables + runMigrations have run. Bump in lockstep with any
+// schema change and add a matching entry in the migrations map below.
+const currentSchemaVersion = 2
 
-// initSchemaVersion ensures schema_version has exactly one row. An
-// empty table (fresh DB, or DB created before this table existed) gets
-// seeded with currentSchemaVersion. A populated table is left alone —
-// we do not downgrade or overwrite a version that a future release may
-// have already bumped.
+// migrations lists the idempotent DDL run to bring a DB at version N-1
+// up to version N, keyed by the target version. `ALTER TABLE ADD
+// COLUMN` is safe and O(1) in SQLite (metadata-only) so these run fast
+// even on large token tables.
+//
+// The v2 migration adds the RFC 8707 Resource Indicator columns:
+//
+//	auth_requests.resource   — the resource value the client sent to /authorize
+//	auth_codes.resource      — carried through from auth_requests, re-asserted at /token
+//	access_tokens.audience   — canonical resource the token was issued for
+//	refresh_tokens.audience  — inherited by access tokens minted from this refresh
+//
+// All columns default to '' so pre-v0.9 rows read as "no audience
+// bound" — backwards-compat preserved.
+var migrations = map[int]string{
+	2: `
+		ALTER TABLE auth_requests  ADD COLUMN resource TEXT NOT NULL DEFAULT '';
+		ALTER TABLE auth_codes     ADD COLUMN resource TEXT NOT NULL DEFAULT '';
+		ALTER TABLE access_tokens  ADD COLUMN audience TEXT NOT NULL DEFAULT '';
+		ALTER TABLE refresh_tokens ADD COLUMN audience TEXT NOT NULL DEFAULT '';
+	`,
+}
+
+// initSchemaVersion ensures schema_version has exactly one row and runs
+// any pending migrations to bring the DB up to currentSchemaVersion.
+//
+// Seeding policy:
+//
+//	empty table        → seed at 1 (legacy DB, pre-schema_version) and
+//	                     run forward migrations up to current.
+//	row present at N   → if N < currentSchemaVersion, run migrations N+1..current.
+//	                     if N == currentSchemaVersion, no-op.
+//	                     if N > currentSchemaVersion, leave the row alone
+//	                     (a newer library version may have bumped it; we
+//	                     must not downgrade a DB we don't understand).
 func (s *OAuthStore) initSchemaVersion() error {
 	var count int
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count); err != nil {
 		return fmt.Errorf("read schema_version: %w", err)
 	}
 	if count == 0 {
-		if _, err := s.db.Exec("INSERT INTO schema_version (version) VALUES (?)", currentSchemaVersion); err != nil {
+		// Legacy DB created before schema_version existed. Its physical
+		// shape matches version 1 (createTables before the v2 migration
+		// added the resource/audience columns), so seed at 1 and let the
+		// migration loop below bring it up to current.
+		if _, err := s.db.Exec("INSERT INTO schema_version (version) VALUES (?)", 1); err != nil {
 			return fmt.Errorf("seed schema_version: %w", err)
+		}
+	}
+
+	var version int
+	if err := s.db.QueryRow("SELECT version FROM schema_version LIMIT 1").Scan(&version); err != nil {
+		return fmt.Errorf("read schema_version row: %w", err)
+	}
+	if version > currentSchemaVersion {
+		// Newer DB from a future library version. Do not alter.
+		return nil
+	}
+
+	for v := version + 1; v <= currentSchemaVersion; v++ {
+		ddl, ok := migrations[v]
+		if !ok {
+			// A gap in the migrations map is a programmer error — every
+			// version between 1 and currentSchemaVersion must be
+			// reachable. Fail loud rather than silently skip.
+			return fmt.Errorf("no migration defined for schema version %d", v)
+		}
+		if _, err := s.db.Exec(ddl); err != nil {
+			return fmt.Errorf("run migration to v%d: %w", v, err)
+		}
+		if _, err := s.db.Exec("UPDATE schema_version SET version = ?", v); err != nil {
+			return fmt.Errorf("update schema_version to %d: %w", v, err)
 		}
 	}
 	return nil
@@ -380,9 +462,9 @@ func (s *OAuthStore) StoreAuthCode(code string, data AuthCodeData) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
 		`INSERT INTO auth_codes (code, client_id, redirect_uri, code_challenge,
-			code_challenge_method, scope, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			code_challenge_method, scope, resource, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		hashSecret(code), data.ClientID, data.RedirectURI, data.CodeChallenge,
-		data.CodeChallengeMethod, data.Scope, data.CreatedAt,
+		data.CodeChallengeMethod, data.Scope, data.Resource, data.CreatedAt,
 	)
 	return err
 }
@@ -405,9 +487,11 @@ func (s *OAuthStore) ConsumeAuthCode(code string) (*AuthCodeData, error) {
 	}
 	defer tx.Rollback() // no-op after Commit
 
-	row := tx.QueryRow("SELECT client_id, redirect_uri, code_challenge, code_challenge_method, scope, created_at FROM auth_codes WHERE code = ?", hashed)
+	row := tx.QueryRow(
+		`SELECT client_id, redirect_uri, code_challenge, code_challenge_method,
+			scope, resource, created_at FROM auth_codes WHERE code = ?`, hashed)
 	var d AuthCodeData
-	if err := row.Scan(&d.ClientID, &d.RedirectURI, &d.CodeChallenge, &d.CodeChallengeMethod, &d.Scope, &d.CreatedAt); err != nil {
+	if err := row.Scan(&d.ClientID, &d.RedirectURI, &d.CodeChallenge, &d.CodeChallengeMethod, &d.Scope, &d.Resource, &d.CreatedAt); err != nil {
 		return nil, err
 	}
 
@@ -441,8 +525,8 @@ func (s *OAuthStore) StoreAccessToken(token string, data TokenData) error {
 	}
 
 	_, err := s.db.Exec(
-		"INSERT INTO access_tokens (token, client_id, scope, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
-		hashSecret(token), data.ClientID, data.Scope, data.ExpiresAt, data.CreatedAt,
+		"INSERT INTO access_tokens (token, client_id, scope, audience, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		hashSecret(token), data.ClientID, data.Scope, data.Audience, data.ExpiresAt, data.CreatedAt,
 	)
 	return err
 }
@@ -453,27 +537,83 @@ func (s *OAuthStore) StoreAccessToken(token string, data TokenData) error {
 // if every space-separated token in requiredScope is present in the
 // granted scope. Pass "" to skip scope enforcement entirely.
 // Expired tokens are lazily deleted on verification.
+//
+// VerifyAccessToken does NOT enforce RFC 8707 audience binding — it
+// was the pre-v0.9 API and remains audience-agnostic so existing
+// callers (and the static-bearer/custom-validator branches of
+// BearerMiddleware) keep working unchanged. Callers that need
+// audience enforcement should use VerifyAccessTokenForResource.
 func (s *OAuthStore) VerifyAccessToken(token string, requiredScope string) bool {
+	ok, _ := s.verifyAccessToken(token, requiredScope)
+	return ok
+}
+
+// VerifyAccessTokenForResource performs the same checks as
+// VerifyAccessToken and additionally enforces RFC 8707 audience
+// binding: if the token was issued for a canonical resource (non-empty
+// Audience) AND the caller has declared an expected resource (non-empty
+// expectedResource), the two must match exactly.
+//
+// Semantics for the audience comparison:
+//
+//	stored="",  expect=*   → accepted (legacy un-bound token; no
+//	                         binding was recorded at issuance so none
+//	                         is enforced).
+//	stored=X,   expect=""  → accepted (caller opted out of audience
+//	                         enforcement, typically a server with no
+//	                         ExternalURL configured or a legacy
+//	                         BearerMiddleware entry point — treat the
+//	                         token as any other valid bearer).
+//	stored=X,   expect=X   → accepted.
+//	stored=X,   expect=Y   → rejected. The token was issued for a
+//	                         different resource server and must not be
+//	                         replayed here (the RFC 8707 core threat
+//	                         model).
+//
+// Note the asymmetry: expectedResource="" is an explicit caller opt-out
+// (no enforcement), while stored=""  is a per-token legacy tolerance
+// (no binding to enforce). Both default to "accept" so the v0.8→v0.9
+// migration — where tokens may or may not carry an audience and
+// middleware may or may not check — never produces a false-reject.
+// A false-accept in this matrix would require stored=X AND expect=Y
+// AND X!=Y, which is the case the RFC exists to prevent.
+//
+// expectedResource is typically the library's own canonical resource
+// URI (ExternalURL + ResourcePath); pass "" to disable enforcement.
+func (s *OAuthStore) VerifyAccessTokenForResource(token, requiredScope, expectedResource string) bool {
+	ok, audience := s.verifyAccessToken(token, requiredScope)
+	if !ok {
+		return false
+	}
+	if audience == "" || expectedResource == "" {
+		return true
+	}
+	return audience == expectedResource
+}
+
+func (s *OAuthStore) verifyAccessToken(token, requiredScope string) (valid bool, audience string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	hashed := hashSecret(token)
 	var expiresAt int64
 	var scope string
-	err := s.db.QueryRow("SELECT expires_at, scope FROM access_tokens WHERE token = ?", hashed).Scan(&expiresAt, &scope)
+	err := s.db.QueryRow(
+		"SELECT expires_at, scope, audience FROM access_tokens WHERE token = ?", hashed,
+	).Scan(&expiresAt, &scope, &audience)
 	if err != nil {
 		if err != sql.ErrNoRows {
 			log.Printf("mcpserver: failed to verify access token: %v", err)
 		}
-		return false
+		return false, ""
 	}
 	if time.Now().Unix() > expiresAt {
 		if _, err := s.db.Exec("DELETE FROM access_tokens WHERE token = ?", hashed); err != nil {
 			log.Printf("mcpserver: failed to delete expired token: %v", err)
 		}
-		return false
+		return false, ""
 	}
-	return ScopeContains(scope, requiredScope)
+	return ScopeContains(scope, requiredScope), audience
 }
 
 // ScopeContains reports whether granted (space-delimited) covers every
@@ -525,8 +665,8 @@ func (s *OAuthStore) StoreRefreshToken(token string, data TokenData) error {
 	}
 
 	_, err := s.db.Exec(
-		"INSERT INTO refresh_tokens (token, client_id, scope, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
-		hashSecret(token), data.ClientID, data.Scope, data.ExpiresAt, data.CreatedAt,
+		"INSERT INTO refresh_tokens (token, client_id, scope, audience, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		hashSecret(token), data.ClientID, data.Scope, data.Audience, data.ExpiresAt, data.CreatedAt,
 	)
 	return err
 }
@@ -537,6 +677,11 @@ func (s *OAuthStore) StoreRefreshToken(token string, data TokenData) error {
 // is left in place and an error is returned — this preserves the
 // legitimate client's ability to refresh when a second party presents
 // the same token with a wrong client_id.
+//
+// The returned TokenData carries the refresh token's recorded Audience
+// so the caller (/token refresh exchange) can inherit it onto the new
+// access token — RFC 8707 §2.2 requires the downstream token to be
+// audience-bound to the same resource as the original grant.
 func (s *OAuthStore) ConsumeRefreshToken(token, expectedClientID string) (*TokenData, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -549,9 +694,9 @@ func (s *OAuthStore) ConsumeRefreshToken(token, expectedClientID string) (*Token
 	}
 	defer tx.Rollback() // no-op after Commit
 
-	row := tx.QueryRow("SELECT client_id, scope, expires_at, created_at FROM refresh_tokens WHERE token = ?", hashed)
+	row := tx.QueryRow("SELECT client_id, scope, audience, expires_at, created_at FROM refresh_tokens WHERE token = ?", hashed)
 	var d TokenData
-	if err := row.Scan(&d.ClientID, &d.Scope, &d.ExpiresAt, &d.CreatedAt); err != nil {
+	if err := row.Scan(&d.ClientID, &d.Scope, &d.Audience, &d.ExpiresAt, &d.CreatedAt); err != nil {
 		return nil, err
 	}
 	// Verify client binding BEFORE deleting. A mismatched client_id
@@ -622,10 +767,11 @@ func (s *OAuthStore) StoreAuthRequest(requestID string, data map[string]string) 
 	}
 
 	_, err := s.db.Exec(
-		`INSERT INTO auth_requests (request_id, client_id, redirect_uri, state, code_challenge, code_challenge_method, scope, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO auth_requests (request_id, client_id, redirect_uri, state, code_challenge, code_challenge_method, scope, resource, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		requestID, data["client_id"], data["redirect_uri"], data["state"],
-		data["code_challenge"], data["code_challenge_method"], data["scope"], time.Now().Unix(),
+		data["code_challenge"], data["code_challenge_method"], data["scope"],
+		data["resource"], time.Now().Unix(),
 	)
 	return err
 }
@@ -645,12 +791,13 @@ func (s *OAuthStore) GetAuthRequest(requestID string) (map[string]string, error)
 	}
 	defer tx.Rollback() // no-op after Commit
 
-	var clientID, redirectURI, state, codeChallenge, codeChallengeMethod, scope string
+	var clientID, redirectURI, state, codeChallenge, codeChallengeMethod, scope, resource string
 	var createdAt int64
 	err = tx.QueryRow(
-		"SELECT client_id, redirect_uri, state, code_challenge, code_challenge_method, scope, created_at FROM auth_requests WHERE request_id = ?",
+		`SELECT client_id, redirect_uri, state, code_challenge, code_challenge_method,
+			scope, resource, created_at FROM auth_requests WHERE request_id = ?`,
 		requestID,
-	).Scan(&clientID, &redirectURI, &state, &codeChallenge, &codeChallengeMethod, &scope, &createdAt)
+	).Scan(&clientID, &redirectURI, &state, &codeChallenge, &codeChallengeMethod, &scope, &resource, &createdAt)
 	if err != nil {
 		return nil, err
 	}
@@ -673,6 +820,7 @@ func (s *OAuthStore) GetAuthRequest(requestID string) (map[string]string, error)
 		"code_challenge":        codeChallenge,
 		"code_challenge_method": codeChallengeMethod,
 		"scope":                 scope,
+		"resource":              resource,
 	}, nil
 }
 

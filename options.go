@@ -145,6 +145,26 @@ func WithAllowMissingState() Option {
 	return func(s *Server) { s.oauthConfig.AllowMissingState = true }
 }
 
+// WithRequireResourceIndicator requires every /authorize and /token
+// request to include an RFC 8707 `resource` parameter matching the
+// server's canonical resource URI (ExternalURL + /mcp path). The
+// 2025-06-18 MCP spec says clients MUST send it; this option makes
+// the server side symmetric and rejects legacy clients that omit it.
+//
+// Leave unset (the default) during the transition: the server still
+// validates the parameter when present and binds the token to the
+// audience, so audience enforcement kicks in automatically as clients
+// upgrade. Opt in once every client in a deployment is known to send
+// `resource` (check deployment logs for any `invalid_target` responses
+// before flipping the flag).
+//
+// Has no effect if WithExternalURL is unset — the server has no
+// canonical URI to validate against in that mode, and
+// validateResourceParam already rejects any non-empty resource.
+func WithRequireResourceIndicator() Option {
+	return func(s *Server) { s.oauthConfig.RequireResourceIndicator = true }
+}
+
 // WithMiddleware sets an outer middleware that wraps the entire handler chain
 // (including bearer auth). This runs before any auth check, so it can inspect
 // the raw Authorization header to tag the request context with application-

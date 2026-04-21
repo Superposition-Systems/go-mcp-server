@@ -173,7 +173,30 @@ func sanitizeChallenge(s string) string {
 // protectedPaths lists path prefixes that require authentication (e.g. "/mcp").
 // All other paths pass through without auth — use your reverse proxy (e.g.
 // Traefik with qa-gate) to protect those routes at the infrastructure layer.
+//
+// BearerMiddleware does not enforce RFC 8707 audience binding. Use
+// BearerMiddlewareForResource when the server has a canonical resource
+// URI to check tokens against.
 func BearerMiddleware(bearerToken string, tokenValidator func(string) bool, store *OAuthStore, requiredScope string, protectedPaths ...string) func(http.Handler) http.Handler {
+	return BearerMiddlewareForResource(bearerToken, tokenValidator, store, requiredScope, "", protectedPaths...)
+}
+
+// BearerMiddlewareForResource is the audience-aware variant of
+// BearerMiddleware. The expectedResource argument is the server's
+// RFC 8707 canonical resource URI (typically ExternalURL + ResourcePath,
+// as advertised in ProtectedResource metadata); tokens issued with a
+// non-empty Audience must match it.
+//
+// Pass "" for expectedResource to disable audience enforcement —
+// identical behaviour to BearerMiddleware. This is the right call when
+// the server has no configured ExternalURL (local dev) or when the
+// operator has chosen to defer adoption.
+//
+// Tokens with an empty stored Audience (the pre-v0.9 shape, plus any
+// 2025-03-26-era client that omits the resource parameter) are always
+// accepted regardless of expectedResource — otherwise the migration
+// from v0.8 to v0.9 would invalidate every token in the wild.
+func BearerMiddlewareForResource(bearerToken string, tokenValidator func(string) bool, store *OAuthStore, requiredScope, expectedResource string, protectedPaths ...string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			path := r.URL.Path
@@ -211,19 +234,28 @@ func BearerMiddleware(bearerToken string, tokenValidator func(string) bool, stor
 			}
 
 			// Custom token validator (supports multi-token, scoped auth, etc.)
+			// The custom validator is given full authority over its tokens —
+			// we do not layer audience enforcement on top because the custom
+			// validator may be validating tokens this library never issued
+			// (hence it has no Audience record in our store to check against).
 			if tokenValidator != nil && tokenValidator(token) {
 				passWith(AuthPathCustomValidator)
 				return
 			}
 
-			// Static bearer token (CLI tools)
+			// Static bearer token (CLI tools). Same rationale as the custom
+			// validator — a static bearer is operator-issued, not
+			// OAuth-flow-issued, and has no audience binding to check.
 			if bearerToken != "" && SafeEqual(token, bearerToken) {
 				passWith(AuthPathStaticBearer)
 				return
 			}
 
-			// OAuth access token (claude.ai)
-			if store != nil && store.VerifyAccessToken(token, requiredScope) {
+			// OAuth access token (claude.ai). This is the path that can
+			// carry an audience binding — defer to the store which knows
+			// both the stored Audience and the policy (empty stored
+			// audience → accept anyway for backcompat).
+			if store != nil && store.VerifyAccessTokenForResource(token, requiredScope, expectedResource) {
 				passWith(AuthPathOAuth)
 				return
 			}
