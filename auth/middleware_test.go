@@ -295,6 +295,128 @@ func TestVerifyClientSecretConstantTime(t *testing.T) {
 	}
 }
 
+func TestBearerMiddlewareOptionalMissingPassesThrough(t *testing.T) {
+	store := newTestStore(t)
+	middleware := BearerMiddlewareForResourceOptional("my-secret", nil, store, "", "", "/mcp")
+
+	called := false
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := middleware(inner)
+
+	// No Authorization header — should pass through, not 401.
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 when Authorization absent and optional=true, got %d", rec.Code)
+	}
+	if !called {
+		t.Error("expected inner handler to be invoked")
+	}
+}
+
+func TestBearerMiddlewareOptionalInvalidStillRejected(t *testing.T) {
+	store := newTestStore(t)
+	middleware := BearerMiddlewareForResourceOptional("my-secret", nil, store, "", "", "/mcp")
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := middleware(inner)
+
+	// Present-but-wrong bearer — caller signaled intent to authenticate
+	// and failed all three branches; this is still 401.
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	req.Header.Set("Authorization", "Bearer not-the-right-token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for invalid bearer even with optional=true, got %d", rec.Code)
+	}
+}
+
+func TestBearerMiddlewareOptionalStaticBearerStillAccepted(t *testing.T) {
+	store := newTestStore(t)
+	middleware := BearerMiddlewareForResourceOptional("my-secret", nil, store, "", "", "/mcp")
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := middleware(inner)
+
+	// Valid static bearer — should still be accepted via the
+	// existing static-bearer branch when optional=true.
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	req.Header.Set("Authorization", "Bearer my-secret")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 with valid static bearer and optional=true, got %d", rec.Code)
+	}
+}
+
+func TestBearerMiddlewareOptionalOAuthStillAccepted(t *testing.T) {
+	store := newTestStore(t)
+	middleware := BearerMiddlewareForResourceOptional("static-token", nil, store, "mcp:tools", "", "/mcp")
+
+	now := time.Now().Unix()
+	token := "oauth-access-token-optional"
+	err := store.StoreAccessToken(token, TokenData{
+		ClientID:  "client-1",
+		Scope:     "mcp:tools",
+		ExpiresAt: now + 3600,
+		CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("failed to store access token: %v", err)
+	}
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := middleware(inner)
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 with valid OAuth token and optional=true, got %d", rec.Code)
+	}
+}
+
+func TestBearerMiddlewareNonOptionalStillRejectsMissing(t *testing.T) {
+	// Regression check: the default (non-optional) middleware must
+	// still 401 on a missing Authorization header.
+	store := newTestStore(t)
+	middleware := BearerMiddlewareForResource("my-secret", nil, store, "", "", "/mcp")
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := middleware(inner)
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 when Authorization absent and optional=false, got %d", rec.Code)
+	}
+}
+
 func TestBearerMiddlewareMultipleProtectedPaths(t *testing.T) {
 	store := newTestStore(t)
 	middleware := BearerMiddleware("tok", nil, store, "", "/mcp", "/api")

@@ -34,6 +34,7 @@ type Server struct {
 	oauthConfig     auth.OAuthConfig
 	bearerToken     string
 	tokenValidator  func(string) bool
+	optionalAuth    bool
 	mcpPath         string
 	tools           ToolHandler
 	healthFunc      http.HandlerFunc
@@ -317,7 +318,11 @@ func (s *Server) ListenAndServe() error {
 	// enforced on incoming requests. An empty expectedResource (server
 	// without ExternalURL — typical local dev) disables enforcement
 	// without breaking pre-v0.9 tokens that have no audience recorded.
-	var handler http.Handler = auth.BearerMiddlewareForResource(
+	bearerMW := auth.BearerMiddlewareForResource
+	if s.optionalAuth {
+		bearerMW = auth.BearerMiddlewareForResourceOptional
+	}
+	var handler http.Handler = bearerMW(
 		s.bearerToken, s.tokenValidator, oauthStore, s.oauthConfig.Scope,
 		oauthHandler.CanonicalResource(), s.mcpPath,
 	)(afterAuth)
@@ -364,6 +369,7 @@ func (s *Server) ListenAndServe() error {
 	log.Printf("mcpserver: MCP endpoint: %s", s.mcpPath)
 	log.Printf("mcpserver: bearer token configured: %v", s.bearerToken != "")
 	log.Printf("mcpserver: token validator configured: %v", s.tokenValidator != nil)
+	log.Printf("mcpserver: optional auth enabled: %v", s.optionalAuth)
 	pinConfigured := pinAtHandlerBuild != ""
 	log.Printf("mcpserver: OAuth PIN configured: %v", pinConfigured)
 	if !pinConfigured {

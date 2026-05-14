@@ -178,7 +178,7 @@ func sanitizeChallenge(s string) string {
 // BearerMiddlewareForResource when the server has a canonical resource
 // URI to check tokens against.
 func BearerMiddleware(bearerToken string, tokenValidator func(string) bool, store *OAuthStore, requiredScope string, protectedPaths ...string) func(http.Handler) http.Handler {
-	return BearerMiddlewareForResource(bearerToken, tokenValidator, store, requiredScope, "", protectedPaths...)
+	return bearerMiddleware(bearerToken, tokenValidator, store, requiredScope, "", false, protectedPaths...)
 }
 
 // BearerMiddlewareForResource is the audience-aware variant of
@@ -197,6 +197,34 @@ func BearerMiddleware(bearerToken string, tokenValidator func(string) bool, stor
 // accepted regardless of expectedResource — otherwise the migration
 // from v0.8 to v0.9 would invalidate every token in the wild.
 func BearerMiddlewareForResource(bearerToken string, tokenValidator func(string) bool, store *OAuthStore, requiredScope, expectedResource string, protectedPaths ...string) func(http.Handler) http.Handler {
+	return bearerMiddleware(bearerToken, tokenValidator, store, requiredScope, expectedResource, false, protectedPaths...)
+}
+
+// BearerMiddlewareForResourceOptional is the variant of
+// BearerMiddlewareForResource that lets requests without an Authorization
+// header pass through to the inner handler instead of returning 401.
+// Present-but-invalid bearers still return 401 — "missing" and
+// "present-but-wrong" are treated as different signals of caller intent.
+//
+// Use when a downstream middleware will perform identity enforcement at
+// the application layer for some or all requests. The canonical case is
+// SPS Platform → Traxos: SPS embeds a signed identity_token in the
+// JSON-RPC body's _meta.context and a downstream middleware verifies it.
+// Transport-level bearer enforcement is redundant for SPS but is still
+// the right gate for claude.ai (OAuth) and CLI tools (static bearer);
+// this option relaxes only the missing-token case so all three auth
+// shapes can coexist on the same /mcp endpoint.
+//
+// SECURITY: with optional auth enabled, the inner handler MUST enforce
+// authentication for any non-public method/path it accepts.
+func BearerMiddlewareForResourceOptional(bearerToken string, tokenValidator func(string) bool, store *OAuthStore, requiredScope, expectedResource string, protectedPaths ...string) func(http.Handler) http.Handler {
+	return bearerMiddleware(bearerToken, tokenValidator, store, requiredScope, expectedResource, true, protectedPaths...)
+}
+
+// bearerMiddleware is the shared implementation. The optional argument
+// controls whether a missing Authorization header returns 401 (false,
+// the default) or passes through to the inner handler (true).
+func bearerMiddleware(bearerToken string, tokenValidator func(string) bool, store *OAuthStore, requiredScope, expectedResource string, optional bool, protectedPaths ...string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			path := r.URL.Path
@@ -217,6 +245,10 @@ func BearerMiddlewareForResource(bearerToken string, tokenValidator func(string)
 
 			token := parseBearer(r.Header.Get("Authorization"))
 			if token == "" {
+				if optional {
+					next.ServeHTTP(w, r)
+					return
+				}
 				writeUnauthorized(w, "missing or malformed bearer token")
 				return
 			}

@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.10.0] — 2026-05-14
+
+Additive: a new authentication mode that lets a downstream middleware
+own the auth decision for callers that don't carry an `Authorization`
+header, while preserving transport-level enforcement for callers that
+do.
+
+**Zero breaking changes.** All v0.9 callers keep compiling and
+behaving identically. The new behaviour is opt-in via
+`WithOptionalAuth()` at the server level (or
+`BearerMiddlewareForResourceOptional` for direct middleware callers).
+
+### Added — optional transport-level auth
+
+- **`WithOptionalAuth()` server option.** When set, the bearer
+  middleware lets requests *without* an Authorization header pass
+  through to the inner handler chain instead of returning 401.
+  Requests that *do* carry an Authorization header are validated
+  through the existing three branches (custom validator → static
+  bearer → OAuth); present-but-invalid bearers still return 401
+  unchanged. "Missing" and "present-but-wrong" are treated as
+  distinct signals of caller intent.
+- **`auth.BearerMiddlewareForResourceOptional`** — direct-middleware
+  equivalent for callers that wire the middleware themselves rather
+  than going through `Server`.
+- **Startup log line** `mcpserver: optional auth enabled: <bool>`
+  alongside the existing bearer/validator/PIN status lines, so
+  operators can confirm the mode at a glance.
+
+### Use case
+
+The canonical case is SPS Platform → MCP tool server. SPS embeds a
+signed `identity_token` in the JSON-RPC body's `_meta.context`, and a
+downstream middleware on the tool server side verifies that claim
+before dispatching `tools/call`. Transport-level bearer enforcement is
+redundant for that flow but is still the right gate for claude.ai
+(OAuth) and CLI tools (static bearer). With `WithOptionalAuth()`, all
+three caller shapes coexist on the same `/mcp` endpoint:
+
+- claude.ai sends `Authorization: Bearer <oauth_token>` → OAuth branch
+  accepts as before.
+- CLI tools send `Authorization: Bearer <static_secret>` → static
+  branch accepts as before.
+- SPS sends no Authorization header at all → middleware passes through
+  to the inner handler, which enforces identity via the body claim.
+
+### Security note
+
+`WithOptionalAuth()` MUST be paired with a downstream middleware that
+enforces authentication for non-public methods or paths the inner
+handler accepts. Without that, enabling this option exposes the inner
+handler to anonymous callers. Tests added in
+`auth/middleware_test.go` cover (missing+optional → passthrough,
+invalid+optional → 401, static+optional → accepted, OAuth+optional →
+accepted, missing+non-optional → 401 regression).
+
 ## [v0.9.0] — 2026-04-21
 
 MCP 2025-06-18 spec uptake — targeted, additive. Three spec deltas that

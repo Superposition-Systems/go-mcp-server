@@ -63,6 +63,31 @@ func WithTokenValidator(fn func(token string) bool) Option {
 	return func(s *Server) { s.tokenValidator = fn }
 }
 
+// WithOptionalAuth makes the server's bearer middleware allow requests
+// without an Authorization header to pass through to the inner handler
+// chain instead of returning 401. Requests that DO carry an
+// Authorization header are still validated through the normal three
+// branches (custom validator → static bearer → OAuth), so present-but-
+// invalid tokens still 401.
+//
+// Use this when a downstream middleware (registered with WithMiddleware)
+// performs identity enforcement at the application layer for the
+// requests that need it. The canonical case is SPS Platform → MCP tool
+// server: SPS embeds a signed identity_token in the JSON-RPC body's
+// _meta.context, and a downstream middleware verifies that claim before
+// dispatching tools/call. Transport-level auth is redundant on that
+// path, but is still the right gate for claude.ai (OAuth) and CLI tools
+// (static bearer); this option only relaxes the missing-header case so
+// all three caller shapes coexist on /mcp.
+//
+// SECURITY: with this option enabled, requests that omit Authorization
+// reach the inner handler stack with no authentication context. The
+// inner middleware MUST enforce authentication for any non-public
+// method or path it accepts. Do not enable without a downstream gate.
+func WithOptionalAuth() Option {
+	return func(s *Server) { s.optionalAuth = true }
+}
+
 // WithMCPPath sets the MCP endpoint path (default "/mcp").
 // ResourcePath is resolved lazily in ListenAndServe from mcpPath,
 // so this option can be used in any order with WithAuth.
