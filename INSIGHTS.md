@@ -362,3 +362,17 @@ _2026-04-21 16:55_
 `★ Insight ─────────────────────────────────────`
 Two subtle correctness choices worth noting: (1) `tr.IsError` takes precedence over the outer `Call`-level `isError` bool, but only in the *raise* direction — a middleware that forces `isError=true` still wins even if the consumer's `*ToolResult.IsError` is false. That asymmetry matters because middleware-set error state usually means "something the consumer didn't know went wrong upstream" and shouldn't be maskable. (2) An empty `content: []` is emitted rather than omitted when the consumer returns a `*ToolResult` with neither field set — spec says `content` is required. Returning a truly minimal `*ToolResult{}` is almost certainly a consumer bug, but the library holds the spec line rather than escalating to `isError` on their behalf.
 `─────────────────────────────────────────────────`
+---
+_2026-04-21 17:32_
+
+`★ Insight ─────────────────────────────────────`
+For Go libraries on `proxy.golang.org`, the push genuinely is the release — no build pipeline, no artifact publishing step. That's why the safety protocol treats push as a gated action even when commit+tag are cheap locally: pushing `v0.9.0` is what actually makes it a public version available to every consumer's `go get`. Keeping them separate gives you a final inspection window before the release is irrevocably out.
+`─────────────────────────────────────────────────`
+---
+_2026-04-21 17:55_
+
+`★ Insight ─────────────────────────────────────`
+- The RFC 8707 implementation's strength comes from enforcing audience binding at both *issuance* (authorize + token exchange) and *use* (middleware via `VerifyAccessTokenForResource`). Symmetric checks on both sides close the classic "bound at one end but not the other" gap that defeats most audience-binding rollouts.
+- Refresh-token audience *inheritance* (oauth.go:708-729) rather than re-derivation is the right call: a client cannot silently drop the binding by omitting `resource` on refresh, and supplying a mismatched one is rejected. This is the subtle part of RFC 8707 that most implementations get wrong.
+- SQLite `ALTER TABLE … ADD COLUMN … DEFAULT ''` being metadata-only on v1→v2 migration means legacy tokens read as empty-audience — which is the exact "tolerate" cell in the compat matrix. The migration is correct *because* it's lazy; a backfill would've been wrong.
+`─────────────────────────────────────────────────`
